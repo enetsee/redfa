@@ -1,0 +1,3 @@
+(library
+ (name redfa)
+ (libraries ucharset))
