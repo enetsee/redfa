@@ -733,8 +733,11 @@ let cp_outside_charset buf cp =
   | _ when cp >= 0x20 && cp <= 0x7E ->
     let c = Char.chr cp in
     (match c with
+     (* [&] and [~] are redfa's intersection and complement operators, so
+        an unescaped one reparses as a different language, not a literal.
+        Oniguruma takes a backslash before either as the character. *)
      | '\\' | '.' | '[' | ']' | '(' | ')' | '{' | '}' | '*' | '+' | '?' | '|' | '^' | '$'
-       ->
+     | '&' | '~' ->
        Buffer.add_char buf '\\';
        Buffer.add_char buf c
      | _ -> Buffer.add_char buf c)

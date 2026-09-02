@@ -33,10 +33,48 @@ let rec match_star o s =
 (* -- generator ------------------------------------------------------------- *)
 
 (* Four codepoints, so subterms collide constantly and the generated
-   terms exercise the dedup and merge paths. *)
-let alphabet = [| 'a'; 'b'; 'c'; 'd' |]
+   terms exercise the dedup and merge paths. The oracle compares bytes,
+   so this alphabet has to stay single byte; [meta_alphabet] below is
+   for the tests that check a term against itself rather than a
+   corpus. *)
+let alphabet = [| 0x61; 0x62; 0x63; 0x64 |]
 
-let rec gen st depth =
+(* Every character redfa's own grammar reserves, plus the control and
+   non-BMP codepoints the escaping paths special case. A rendering that
+   drops an escape reparses as a different term, which is invisible over
+   an alphabet of plain letters. *)
+let meta_alphabet =
+  [| Char.code '-'
+   ; Char.code ']'
+   ; Char.code '['
+   ; Char.code '^'
+   ; Char.code '|'
+   ; Char.code '.'
+   ; Char.code '~'
+   ; Char.code '&'
+   ; Char.code '('
+   ; Char.code ')'
+   ; Char.code '*'
+   ; Char.code '+'
+   ; Char.code '?'
+   ; Char.code '\\'
+   ; Char.code ':'
+   ; Char.code '{'
+   ; Char.code '}'
+   ; Char.code '$'
+   ; Char.code ' '
+   ; 0x00 (* NUL *)
+   ; 0x09 (* tab *)
+   ; 0x0A (* newline *)
+   ; 0x7F (* DEL *)
+   ; 0x3BB (* two byte *)
+   ; 0xD7FF (* just below the surrogates *)
+   ; 0xE000 (* just above them *)
+   ; 0x10400 (* supplementary plane, four bytes *)
+  |]
+;;
+
+let rec gen ~alphabet st depth =
   let leaf () =
     match Random.State.int st 5 with
     | 0 -> empty, fun _ -> false
@@ -44,15 +82,15 @@ let rec gen st depth =
     | 2 -> any, fun s -> String.length s = 1
     | 3 ->
       let c = alphabet.(Random.State.int st (Array.length alphabet)) in
-      not_singleton_char c, fun s -> String.length s = 1 && s.[0] <> c
+      not_singleton c, fun s -> String.length s = 1 && Char.code s.[0] <> c
     | _ ->
       let c = alphabet.(Random.State.int st (Array.length alphabet)) in
-      singleton (Char.code c), fun s -> String.length s = 1 && s.[0] = c
+      singleton c, fun s -> String.length s = 1 && Char.code s.[0] = c
   in
   if depth <= 0
   then leaf ()
   else (
-    let sub () = gen st (depth - 1) in
+    let sub () = gen ~alphabet st (depth - 1) in
     match Random.State.int st 9 with
     | 0 | 1 -> leaf ()
     | 2 ->
@@ -91,7 +129,8 @@ let corpus =
     else (
       let longer =
         List.concat_map
-          (fun s -> Array.to_list (Array.map (fun c -> s ^ String.make 1 c) alphabet))
+          (fun s ->
+             Array.to_list (Array.map (fun c -> s ^ String.make 1 (Char.chr c)) alphabet))
           acc
       in
       acc @ grow longer (len - 1))
@@ -113,7 +152,7 @@ let check name cond =
 let () =
   let st = Random.State.make [| 20260829 |] in
   for _ = 1 to 3000 do
-    let r, oracle = gen st 3 in
+    let r, oracle = gen ~alphabet st 3 in
     let a = to_ast r in
     List.iter (fun s -> check "eval agrees with oracle" (Ast.eval a s = oracle s)) corpus
   done
@@ -124,7 +163,7 @@ let () =
 let () =
   let st = Random.State.make [| 4242 |] in
   for _ = 1 to 20_000 do
-    let r, _ = gen st 4 in
+    let r, _ = gen ~alphabet st 4 in
     let r = to_ast r in
     if Ast.is_alt r
     then (
@@ -176,6 +215,34 @@ let () =
   same "a*" (star a);
   same "~a" (complement a);
   same "a&b" (inters [ a; b ]);
+  (* The prefix/postfix interaction the published grammar names. A
+     postfix binds tighter than [~], and [~] takes only the one repeat
+     after it. These pin the .mli's grammar block to the parser: they
+     are the shapes the two used to disagree on. *)
+  same "~a*" (complement (star a));
+  same "~a+" (complement (plus a));
+  same "~a?" (complement (opt a));
+  same "(~a)*" (star (complement a));
+  same "~ab" (seq (complement a) b);
+  same "~(ab)" (complement (seq a b));
+  same "~~a*" (complement (complement (star a)));
+  (* The reading is observable, not just structural: [a*] matches the
+     empty string, so its complement does not. *)
+  let matches src t =
+    match of_string src with
+    | Error e -> check (Printf.sprintf "of_string %S: %s" src e.msg) false
+    | Ok r -> check (Printf.sprintf "%S matches %S" src t) (Ast.eval (to_ast r) t)
+  in
+  let rejects src t =
+    match of_string src with
+    | Error e -> check (Printf.sprintf "of_string %S: %s" src e.msg) false
+    | Ok r ->
+      check (Printf.sprintf "%S does not match %S" src t) (not (Ast.eval (to_ast r) t))
+  in
+  rejects "~a*" "";
+  matches "(~a)*" "";
+  matches "~a*" "b";
+  rejects "~a*" "aa";
   same "[^a]" (not_singleton_char 'a');
   same "." any;
   (* The class helpers agree with the sources they stand for. *)
@@ -197,19 +264,17 @@ let () =
 
 (* -- source round trips ---------------------------------------------------- *)
 
-let () =
-  let st = Random.State.make [| 7 |] in
-  for _ = 1 to 4000 do
-    let r, _ = gen st 3 in
+let round_trips ~alphabet ~seed ~n =
+  let st = Random.State.make [| seed |] in
+  for _ = 1 to n do
+    let r, _ = gen ~alphabet st 3 in
     (* Rendering and parsing check each other, so a precedence slip on
        either side shows up here. *)
     let src = to_string r in
     (match of_string src with
-     | Error e -> check ("to_string produced unparseable source: " ^ src) false
-     | Ok back ->
-       check
-         (Printf.sprintf "round trip %s" src)
-         (equivalent r back));
+     | Error e ->
+       check (Printf.sprintf "to_string produced unparseable source %S: %s" src e.msg) false
+     | Ok back -> check (Printf.sprintf "round trip %S" src) (equivalent r back));
     (* Oniguruma output is a subset of the same syntax, once [(?:] is
        read as a group. *)
     match to_oniguruma r with
@@ -219,6 +284,79 @@ let () =
        | Error e ->
          check (Printf.sprintf "oniguruma %S unparseable: %s" oni e.msg) false
        | Ok back -> check (Printf.sprintf "oniguruma round trip %S" oni) (equivalent r back))
+  done
+;;
+
+let () =
+  round_trips ~alphabet ~seed:7 ~n:4000;
+  (* The same round trip over every character the grammar reserves. An
+     escape the emitter forgets makes the output reparse as an operator,
+     which no alphabet of plain letters can show. *)
+  round_trips ~alphabet:meta_alphabet ~seed:1109 ~n:4000
+;;
+
+(* The reserved characters, one at a time, as literals. [&] is the case
+   that used to come back silently as the empty language rather than as
+   an error. *)
+let () =
+  Array.iter
+    (fun cp ->
+       let r = singleton cp in
+       match to_oniguruma r with
+       | Error _ -> ()
+       | Ok oni ->
+         (match of_string oni with
+          | Error e ->
+            check (Printf.sprintf "literal U+%04X emits unparseable %S: %s" cp oni e.msg) false
+          | Ok back ->
+            check
+              (Printf.sprintf "literal U+%04X survives oniguruma as %S" cp oni)
+              (equivalent r back)))
+    meta_alphabet;
+  (* The exact reproductions from the review. *)
+  List.iter
+    (fun src ->
+       match of_string src with
+       | Error e -> check (Printf.sprintf "of_string %S: %s" src e.msg) false
+       | Ok r ->
+         (match to_oniguruma r with
+          | Error _ -> check (Printf.sprintf "to_oniguruma %S refused" src) false
+          | Ok oni ->
+            (match of_string oni with
+             | Error e ->
+               check (Printf.sprintf "%S -> oniguruma %S: %s" src oni e.msg) false
+             | Ok back ->
+               check (Printf.sprintf "%S -> oniguruma %S round trips" src oni) (equivalent r back))))
+    [ "\\&"; "a\\&b"; "\\~"; "\\~*"; "a\\&b|\\~" ]
+;;
+
+(* -- the first-set guard never rejects a live codepoint --------------------- *)
+
+(* [deriv] answers [empty] for every codepoint outside [first_set], so an
+   under-approximation there — or bounds that disagree with the set they
+   summarise — is a wrong answer with no error attached. The oracle
+   shares no code with the engine, so this pins the guard from outside:
+   every string the oracle matches has to begin with a codepoint the
+   first set admits, and the derivative on that codepoint has to be
+   live. *)
+let () =
+  let st = Random.State.make [| 8675309 |] in
+  for _ = 1 to 2000 do
+    let r, oracle = gen ~alphabet st 3 in
+    let a = to_ast r in
+    let fs = Ast.first_set a in
+    List.iter
+      (fun s ->
+         if String.length s > 0 && oracle s
+         then (
+           let cp = Char.code s.[0] in
+           check
+             (Printf.sprintf "first_set admits the start of the match %S" s)
+             (Ucharset.mem fs cp);
+           check
+             (Printf.sprintf "deriv stays live on the start of the match %S" s)
+             (not (Ast.is_empty (Ast.deriv a ~uchr:cp)))))
+      corpus
   done
 ;;
 
@@ -251,69 +389,416 @@ let () =
      | Error _ -> false)
 ;;
 
-(* -- the DFA accepts what the regexes accept ------------------------------- *)
+(* -- the DFA against the regexes and against a reference minimisation ------ *)
 
 module Dfa = Redfa.Dfa
 
-(* Traverse the DFA over [s], returning the accepts list at the state it
-   lands in, or [] if it gets stuck. Stuck means every item's
-   derivative died, so no token can match, matching the empty accepts
-   list the reference gives. *)
-let dfa_accepts dfa s =
-  let rec go id i =
-    if i >= String.length s
-    then Dfa.accepts dfa id
+(* A DFA alphabet that leaves the BMP. The oracle in [gen] compares
+   bytes, so it cannot run this; everything below compares the
+   automaton against [Ast.eval] on the same term instead, which is the
+   reference the DFA tests have always used. The surrogate boundaries
+   and a supplementary-plane codepoint are here because the DFA path
+   had never been driven outside the BMP: [dfa_accepts] used to index
+   bytes. *)
+let wide_alphabet = [| 0x00; Char.code '~'; 0x3BB; 0xD7FF; 0xE000; 0x10400 |]
+
+(* Every string of up to [len] codepoints over [alphabet], as
+   codepoint lists. Strings, being UTF-8, are not what the automaton
+   consumes. *)
+let cp_corpus ~alphabet ~len =
+  let rec grow acc k =
+    if k = 0
+    then acc
     else (
-      let cp = Char.code s.[i] in
-      match List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id) with
-      | None -> []
-      | Some (_, dst) -> go dst (i + 1))
+      let longer =
+        List.concat_map
+          (fun s -> Array.to_list (Array.map (fun c -> s @ [ c ]) alphabet))
+          acc
+      in
+      acc @ grow longer (k - 1))
   in
-  go (Dfa.initial dfa) 0
+  grow [ [] ] len
 ;;
 
-let () =
-  let st = Random.State.make [| 99 |] in
-  for _ = 1 to 400 do
-    let tokens = List.init (1 + Random.State.int st 4) (fun i -> i, fst (gen st 3)) in
+let utf8 cps =
+  let b = Buffer.create 8 in
+  List.iter (fun cp -> Buffer.add_utf_8_uchar b (Uchar.of_int cp)) cps;
+  Buffer.contents b
+;;
+
+(* Traverse the DFA over a codepoint sequence, returning the accepts
+   list at the state it lands in, or [] if it gets stuck. Stuck means
+   every item's derivative died, so no token can match, matching the
+   empty accepts list the reference gives. *)
+let dfa_accepts dfa cps =
+  let rec go id = function
+    | [] -> Dfa.accepts dfa id
+    | cp :: rest ->
+      (match List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id) with
+       | None -> []
+       | Some (_, dst) -> go dst rest)
+  in
+  go (Dfa.initial dfa) cps
+;;
+
+let same_dfa a b =
+  Dfa.num_states a = Dfa.num_states b
+  &&
+  let ok = ref true in
+  Dfa.iter_states a (fun id ->
+    if Dfa.accepts a id <> Dfa.accepts b id then ok := false;
+    if Dfa.reaches a id <> Dfa.reaches b id then ok := false;
+    let ta = Dfa.transitions a id
+    and tb = Dfa.transitions b id in
+    if List.length ta <> List.length tb
+    then ok := false
+    else
+      List.iter2
+        (fun (c1, d1) (c2, d2) -> if not (Ucharset.equal c1 c2 && d1 = d2) then ok := false)
+        ta
+        tb);
+  !ok
+;;
+
+(* -- a reference minimisation ---------------------------------------------- *)
+
+(* Myhill-Nerode by Moore's table-filling algorithm on the completed
+   automaton, over a finite alphabet. It shares no code with
+   [Dfa.minimise]: a different algorithm (mark distinguishable pairs
+   to a fixpoint, rather than refine a partition) over a different
+   representation (a dense transition matrix on representative
+   codepoints, rather than charset signatures).
+
+   Two codepoints in one block of the common refinement of every
+   state's transition labels behave alike from every state, so one
+   representative per block is a faithful finite alphabet. *)
+let effective_alphabet (d : Dfa.t) =
+  let parts = ref [] in
+  Dfa.iter_states d (fun id ->
+    let labels = List.map fst (Dfa.transitions d id) in
+    (* The completion: what the state has no transition on. *)
+    let rest = Ucharset.comp (Ucharset.union_list labels) in
+    parts := Ucharset.Partition.of_blocks (rest :: labels) :: !parts);
+  Array.of_list (Ucharset.Partition.representatives (Ucharset.Partition.meet_all !parts))
+;;
+
+type reference =
+  { min_states : int (* states of the minimal partial DFA *)
+  ; dead : bool array (* per original state: empty residual language *)
+  }
+
+let reference_min (d : Dfa.t) =
+  let n = Dfa.num_states d in
+  let sink = n in
+  let m = n + 1 in
+  let sigma = effective_alphabet d in
+  let k = Array.length sigma in
+  let delta = Array.make_matrix m k sink in
+  for id = 0 to n - 1 do
+    let ts = Dfa.transitions d id in
+    for a = 0 to k - 1 do
+      delta.(id).(a)
+      <- (match List.find_opt (fun (cs, _) -> Ucharset.mem cs sigma.(a)) ts with
+          | Some (_, dst) -> dst
+          | None -> sink)
+    done
+  done;
+  let acc id = if id = sink then [] else Dfa.accepts d id in
+  let dist = Array.make_matrix m m false in
+  for p = 0 to m - 1 do
+    for q = 0 to m - 1 do
+      if acc p <> acc q then dist.(p).(q) <- true
+    done
+  done;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    for p = 0 to m - 1 do
+      for q = p + 1 to m - 1 do
+        if not dist.(p).(q)
+        then
+          for a = 0 to k - 1 do
+            if (not dist.(p).(q)) && dist.(delta.(p).(a)).(delta.(q).(a))
+            then (
+              dist.(p).(q) <- true;
+              dist.(q).(p) <- true;
+              changed := true)
+          done
+      done
+    done
+  done;
+  (* One class per state, named by its least member. *)
+  let repr = Array.make m (-1) in
+  for p = 0 to m - 1 do
+    if repr.(p) = -1
+    then
+      for q = p to m - 1 do
+        if (not dist.(p).(q)) && repr.(q) = -1 then repr.(q) <- p
+      done
+  done;
+  let sink_class = repr.(sink) in
+  let live = Hashtbl.create 16 in
+  let rec walk id =
+    if repr.(id) <> sink_class && not (Hashtbl.mem live repr.(id))
+    then (
+      Hashtbl.add live repr.(id) ();
+      for a = 0 to k - 1 do
+        walk delta.(id).(a)
+      done)
+  in
+  walk 0;
+  let count = Hashtbl.length live in
+  { min_states = (if count = 0 then 1 else count)
+  ; dead = Array.init n (fun id -> repr.(id) = sink_class)
+  }
+;;
+
+(* Which state of [m] stands for each state of [d]. Every state of [d]
+   is reachable, so walking the two together from their initial states
+   reaches all of them; [-1] marks one [minimise] dropped, which it
+   may do only for a state with an empty residual language. *)
+let correspondence (d : Dfa.t) (m : Dfa.t) =
+  let map = Array.make (Dfa.num_states d) (-1) in
+  let rec walk o s =
+    if map.(o) = -1
+    then (
+      map.(o) <- s;
+      List.iter
+        (fun (cs, o') ->
+           match Ucharset.min_elt_opt cs with
+           | None -> ()
+           | Some cp ->
+             (match
+                List.find_opt (fun (cs', _) -> Ucharset.mem cs' cp) (Dfa.transitions m s)
+              with
+              | Some (_, s') -> walk o' s'
+              | None -> ()))
+        (Dfa.transitions d o))
+  in
+  walk (Dfa.initial d) (Dfa.initial m);
+  map
+;;
+
+(* -- the properties -------------------------------------------------------- *)
+
+let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
+  let st = Random.State.make [| seed |] in
+  let corp = cp_corpus ~alphabet ~len in
+  for _ = 1 to trials do
+    let tokens =
+      List.init (1 + Random.State.int st max_tokens) (fun i ->
+        i, fst (gen ~alphabet st depth))
+    in
     let dfa = Dfa.of_tokens tokens in
     let mini = Dfa.minimise dfa in
+    let name what = Printf.sprintf "%s: %s" label what in
+    (* The language, against the regexes themselves. *)
     List.iter
-      (fun s ->
+      (fun cps ->
+         let s = utf8 cps in
          let expected =
            List.filter_map
              (fun (cid, r) -> if Ast.eval (to_ast r) s then Some cid else None)
              tokens
          in
-         check "dfa accepts" (dfa_accepts dfa s = expected);
-         check "minimised dfa accepts" (dfa_accepts mini s = expected))
-      corpus;
-    (* [reaches] is what is still possible from a state, so it holds
-       everything [accepts] does, and a state with nothing reachable
-       has nowhere to go. *)
-    for id = 0 to Dfa.num_states dfa - 1 do
-      let acc = Dfa.accepts dfa id
-      and rch = Dfa.reaches dfa id in
-      check "reaches covers accepts" (List.for_all (fun c -> List.mem c rch) acc);
-      check "reaches ascending and distinct" (rch = List.sort_uniq Int.compare rch);
-      check "accepts ascending and distinct" (acc = List.sort_uniq Int.compare acc);
+         check (name "dfa accepts") (dfa_accepts dfa cps = expected);
+         check (name "minimised dfa accepts") (dfa_accepts mini cps = expected))
+      corp;
+    (* The size, against a reference Myhill-Nerode minimisation. The
+       refinement used to sign a state by its stored transitions, which
+       tells "no transition on c" apart from "a transition on c into a
+       dead state", so dead states and their in-edges survived: about
+       one random rule set in ten came out above the minimum. *)
+    let reference = reference_min dfa in
+    check (name "minimise reaches the minimum") (Dfa.num_states mini = reference.min_states);
+    check (name "minimise is idempotent") (same_dfa mini (Dfa.minimise mini));
+    (* Nothing dead survives, the one exception being the automaton
+       that is nothing but a dead state. *)
+    let dead_survivors = ref 0 in
+    Dfa.iter_states mini (fun id -> if Dfa.is_dead mini id then incr dead_survivors);
+    check
+      (name "no dead state survives")
+      (!dead_survivors = 0 || (Dfa.num_states mini = 1 && reference.dead.(0)));
+    (* What both automata owe their callers. [minimise] rebuilds every
+       transition list, dropping the edges into dead states, so it has
+       to be held to the same promises the construction is. *)
+    let well_formed what a =
+      Dfa.iter_states a (fun id ->
+        let acc = Dfa.accepts a id
+        and rch = Dfa.reaches a id in
+        check (name (what ^ " reaches covers accepts")) (List.for_all (fun c -> List.mem c rch) acc);
+        check (name (what ^ " reaches ascending and distinct")) (rch = List.sort_uniq Int.compare rch);
+        check (name (what ^ " accepts ascending and distinct")) (acc = List.sort_uniq Int.compare acc);
+        check
+          (name (what ^ " is_dead agrees with accepts and transitions"))
+          (Dfa.is_dead a id = (acc = [] && Dfa.transitions a id = []));
+        (* Transitions out of a state are pairwise disjoint, which is
+           what makes the traversal above deterministic, and they
+           arrive in ascending order of least codepoint. *)
+        let css = List.map fst (Dfa.transitions a id) in
+        let rec disjoint = function
+          | [] | [ _ ] -> true
+          | x :: rest ->
+            List.for_all (fun y -> Ucharset.is_empty (Ucharset.inter x y)) rest
+            && disjoint rest
+        in
+        check (name (what ^ " transitions disjoint")) (disjoint css);
+        check (name (what ^ " no empty transition label")) (not (List.exists Ucharset.is_empty css));
+        let mins = List.filter_map Ucharset.min_elt_opt css in
+        check (name (what ^ " labels ascending")) (mins = List.sort Int.compare mins))
+    in
+    well_formed "built" dfa;
+    well_formed "minimised" mini;
+    (* [reaches] at a merged state is the union of those merged: the
+       documented claim, checked against the correspondence between
+       the two automata rather than assumed. *)
+    if reference.dead.(0)
+    then (
+      check (name "an empty language minimises to one state") (Dfa.num_states mini = 1);
+      check (name "that state is dead") (Dfa.is_dead mini 0);
+      let all = ref [] in
+      Dfa.iter_states dfa (fun id -> all := Dfa.reaches dfa id @ !all);
       check
-        "is_dead agrees with accepts and transitions"
-        (Dfa.is_dead dfa id = (acc = [] && Dfa.transitions dfa id = []))
-    done;
-    (* Transitions out of a state are pairwise disjoint, which is what
-       makes the traversal above deterministic. *)
-    for id = 0 to Dfa.num_states dfa - 1 do
-      let css = List.map fst (Dfa.transitions dfa id) in
-      let rec disjoint = function
-        | [] | [ _ ] -> true
-        | x :: rest ->
-          List.for_all (fun y -> Ucharset.is_empty (Ucharset.inter x y)) rest && disjoint rest
-      in
-      check "transitions disjoint" (disjoint css);
-      check "no empty transition label" (not (List.exists Ucharset.is_empty css))
-    done
+        (name "and carries the union of every reaches")
+        (Dfa.reaches mini 0 = List.sort_uniq Int.compare !all))
+    else (
+      let map = correspondence dfa mini in
+      let merged = Array.make (Dfa.num_states mini) [] in
+      Dfa.iter_states dfa (fun id ->
+        check
+          (name "a state is dropped exactly when it is dead")
+          ((map.(id) = -1) = reference.dead.(id));
+        if map.(id) <> -1
+        then (
+          check
+            (name "a merged state accepts what it stood for")
+            (Dfa.accepts mini map.(id) = Dfa.accepts dfa id);
+          merged.(map.(id)) <- Dfa.reaches dfa id @ merged.(map.(id))));
+      Dfa.iter_states mini (fun id ->
+        check
+          (name "reaches at a merged state is the union of those merged")
+          (Dfa.reaches mini id = List.sort_uniq Int.compare merged.(id))))
   done
+;;
+
+let () =
+  (* The single-byte alphabet the suite has always used, over every
+     string of up to three characters. *)
+  check_dfa ~label:"ascii" ~alphabet ~len:3 ~seed:99 ~trials:400 ~depth:3 ~max_tokens:4;
+  check_dfa ~label:"ascii deep" ~alphabet ~len:3 ~seed:20260902 ~trials:150 ~depth:5
+    ~max_tokens:3;
+  (* The same, outside the BMP and across the surrogate boundaries. *)
+  check_dfa ~label:"wide" ~alphabet:wide_alphabet ~len:3 ~seed:4711 ~trials:150 ~depth:3
+    ~max_tokens:3
+;;
+
+(* The review's own reproduction. In "a(b.*&c.*)" the parenthesised
+   half is the empty language said in a way the normal form does not
+   notice, so deriving [a] leaves a state that accepts nothing and
+   goes nowhere. It used to survive minimisation, along with the edge
+   into it. (The regex is quoted because a comment cannot hold a bare
+   "*" followed by ")".) *)
+let () =
+  let d =
+    Dfa.of_tokens
+      [ 0, seq (singleton_char 'a') (inter (seq (singleton_char 'b') (star any))
+                                       (seq (singleton_char 'c') (star any)))
+      ; 1, singleton_char 'd'
+      ]
+  in
+  let m = Dfa.minimise d in
+  check "a(b.*&c.*)|d builds three states" (Dfa.num_states d = 3);
+  check "a(b.*&c.*)|d minimises to two" (Dfa.num_states m = 2);
+  check
+    "the edge into the dead state goes with it"
+    (List.map (fun (cs, dst) -> Ucharset.to_list cs, dst) (Dfa.transitions m 0)
+     = [ [ Char.code 'd', Char.code 'd' ], 1 ]);
+  check "and the survivor is the one that accepts" (Dfa.accepts m 1 = [ 1 ]);
+  (* A whole language that is empty keeps its one state, since an
+     automaton has to have an initial one. *)
+  let e = Dfa.minimise (Dfa.of_tokens [ 0, inter (singleton_char 'a')
+                                             (complement (singleton_char 'a')) ]) in
+  check "an empty language is one dead state" (Dfa.num_states e = 1 && Dfa.is_dead e 0)
+;;
+
+(* -- the intern table gives memory back ------------------------------------ *)
+
+(* Entries are weak, so transient terms are collected on their own. What
+   used to be retained was the bucket array around them: it was sized
+   from the number of terms interned since the last resize, and only
+   ever doubled, so its footprint tracked cumulative interning rather
+   than live entries. Interning half a million distinct terms and
+   dropping them all should leave the heap roughly where it started.
+
+   Compacting more than once is deliberate. The shrink runs at the end
+   of a major cycle, so the array it releases is still garbage at that
+   point and is not reclaimed until the following one. *)
+let () =
+  let compact () =
+    for _ = 1 to 3 do
+      Gc.compact ()
+    done
+  in
+  let live_mb () =
+    float_of_int (Gc.quick_stat ()).Gc.heap_words
+    *. float_of_int (Sys.word_size / 8)
+    /. 1048576.
+  in
+  compact ();
+  let before = live_mb () in
+  let last = ref Ast.eps in
+  for i = 0 to 499_999 do
+    (* Plane 2 either side, so no surrogate is ever asked for. *)
+    last
+    := Ast.star
+         (Ast.seq
+            (Ast.singleton (0x20000 + (i land 0xFFF)))
+            (Ast.singleton (0x30000 + (i lsr 12))))
+  done;
+  ignore (Ast.tag !last);
+  compact ();
+  let after = live_mb () in
+  (* Before the fix this grew by about 12.5 MB at this size; after it,
+     by nothing measurable. The threshold sits an order of magnitude
+     clear of both. *)
+  check
+    (Printf.sprintf "intern table gives memory back (%.2f -> %.2f MB)" before after)
+    (after -. before < 4.0)
+;;
+
+(* [rehash] re-measures the table only when something is interned, so a
+   program that builds a large automaton, drops it and then stops
+   interning holds the bucket array at its peak. [clear_cache] is the
+   release. Last in the file: it orphans every node interned before it,
+   so nothing built earlier may be used after. *)
+let () =
+  let live_mb () =
+    float_of_int (Gc.quick_stat ()).Gc.heap_words
+    *. float_of_int (Sys.word_size / 8)
+    /. 1048576.
+  in
+  (* [.*a.{16}] — 2^17 states, enough that the table is far past the
+     size it starts at. Built and dropped in one expression. *)
+  let states =
+    Dfa.num_states
+      (Dfa.of_tokens
+         [ 0, seqs (star any :: singleton (Char.code 'a') :: List.init 16 (fun _ -> any))
+         ])
+  in
+  check "the automaton is the size the measurement assumes" (states = 131072);
+  Gc.compact ();
+  let held = live_mb () in
+  Ast.clear_cache ();
+  Gc.compact ();
+  let cleared = live_mb () in
+  (* Measured: 4.88 MB held, 0.57 MB after, against a 0.57 MB baseline. *)
+  check
+    (Printf.sprintf "clear_cache releases the table (%.2f -> %.2f MB)" held cleared)
+    (cleared < held -. 2.0);
+  (* The constants are put back, so interning still finds them. *)
+  check "eps survives a clear" (Ast.is_eps (to_ast eps));
+  check "empty survives a clear" (Ast.is_empty (to_ast empty));
+  check "any survives a clear" (Ast.equal (to_ast any) Ast.any)
 ;;
 
 let () =

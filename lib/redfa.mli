@@ -7,6 +7,17 @@
    {!Regex} is where a caller builds or parses a regex. {!Dfa} turns a
    list of them into an automaton. {!Ast} is the normal form the
    engine derives over, exposed for tests and benchmarks.
+
+   {2 Domains}
+
+   Single-domain. The hash-cons table behind {!Ast} is global and
+   unsynchronised, as are the memo fields on every node, so two domains
+   calling into this library at once race — on the table, on the tag
+   counter, and on the memos. Nothing here is safe to share across
+   domains, values included: a node built on one domain may be
+   structurally merged with one built on another only by accident.
+   Confine a program's use of redfa to one domain, or guard it with a
+   lock of your own.
    -------------------------------------------------------------------------- *)
 
 module Ast : sig
@@ -30,6 +41,29 @@ module Ast : sig
   val equal : t -> t -> bool
   val compare : t -> t -> int
   val hash : t -> int
+
+  (* -- the intern table ------------------------------------------------------
+
+     Nodes are held weakly and collected once nothing outside the table
+     refers to them, and the bucket array is resized from the count of
+     entries still live, so it shrinks as readily as it grows. It is
+     re-measured only when something is interned, though: a program that
+     builds a large automaton, drops it and then stops interning holds
+     the array at its peak until it interns again, or until it calls
+     {!clear_cache}.
+
+     [clear_cache ()] empties the table and returns the array to its
+     initial size. Interning starts over, so a node from before the call
+     and one from after are distinct records even when structurally
+     equal: {!equal} answers false for such a pair, and the sorted-
+     distinct form of [Alt] and [Inter], which is maintained by tag, is
+     only guaranteed among nodes interned between the same two clears.
+     Tags stay unique for the life of the process either way. Call it
+     only once every {!Regex.t} and {!Dfa.t} built so far has been
+     dropped.
+     ------------------------------------------------------------------------ *)
+
+  val clear_cache : unit -> unit
 
   (* -- constants and predicates -------------------------------------------- *)
 
@@ -199,10 +233,16 @@ module Regex : sig
 
        alt    := inter ('|' inter)*
        inter  := concat ('&' concat)*
-       concat := repeat*
-       repeat := prefix ('*' | '+' | '?')*
-       prefix := '~' prefix | atom
+       concat := prefix*
+       prefix := '~' prefix | repeat
+       repeat := atom ('*' | '+' | '?')*
        atom   := '(' alt ')' | '[' class ']' | '.' | escape | literal
+
+     A postfix binds tighter than the [~] prefix: [~a*] complements
+     [a*] rather than repeating [~a], so it does not match the empty
+     string. Write [(~a)*] for the other reading. And [~] takes only
+     the one repeat that follows it, so [~ab] is [(~a)b], not
+     [~(ab)].
 
      Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the shorthand
      classes [\d], [\w], [\s] with their negations, and a backslash
@@ -296,18 +336,25 @@ module Dfa : sig
 
   val iter_states : t -> (state_id -> unit) -> unit
 
-  (* Collapses states that accept the same tokens and, on every input,
-     go to equivalent states.
+  (* The smallest DFA accepting the same tokens. Two things happen:
+     states that accept the same tokens and, on every input, go to
+     equivalent states are merged, and states no accepting state is
+     reachable from are dropped along with every edge into them.
 
      Construction already quotients terms by associativity,
-     commutativity and idempotence, so what this finds is two terms
-     denoting the same language through different structure.
+     commutativity and idempotence, so a merge is two terms denoting
+     the same language through different structure. A drop is a term
+     whose language is empty without the normal form noticing, such as
+     the intersection left after deriving "a(b.*&c.*)" on [a].
 
      The initial state of the result is the one holding the original
      initial state, and the rest are numbered by breadth-first search
      from it, so the numbering is canonical for a given input.
-     {!reaches} at a merged state is the union of those merged.
-     Idempotent. *)
+     {!reaches} at a merged state is the union of those merged; a
+     dropped state takes its own with it. {!is_dead} is false of every
+     state of the result, the one exception being the automaton for
+     the empty language, which is a single dead state because an
+     automaton still needs an initial one. Idempotent. *)
   val minimise : t -> t
 
   val pp : Format.formatter -> t -> unit

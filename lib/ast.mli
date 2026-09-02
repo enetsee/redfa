@@ -8,6 +8,8 @@ val equal : t -> t -> bool
 val compare : t -> t -> int
 val hash : t -> int
 
+val clear_cache : unit -> unit
+
 val empty : t
 val eps : t
 val any : t

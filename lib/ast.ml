@@ -18,9 +18,15 @@ type t =
   ; nullable : bool (* [is_nullable]; a bottom-up property, so computed at intern time *)
   ; mutable approx : Ucharset.Partition.t option
     (* memoised [approx_partition]; see the comment there *)
-  ; mutable first : Ucharset.t option (* memoised [first_set]; see the comment there *)
-  ; mutable f_lo : int (* least element of [first]; see the guard in [deriv] *)
-  ; mutable f_hi : int (* greatest element of [first]; [f_lo > f_hi] when empty *)
+  ; mutable first : fmemo (* memoised [first_set]; see the comment there *)
+  }
+
+(* The first set and the bounds [deriv] guards with, in one immutable
+   block so a single pointer write publishes all three. *)
+and fmemo =
+  { fs : Ucharset.t
+  ; flo : int (* least element of [fs] *)
+  ; fhi : int (* greatest element of [fs]; [flo > fhi] when empty *)
   }
 
 and node =
@@ -30,6 +36,10 @@ and node =
   | Inter of t list
   | Not of t
   | Star of t
+
+(* The sentinel every node starts with. Compared by address, so an
+   empty first set is still distinguishable from an uncomputed one. *)
+let no_fmemo = { fs = Ucharset.empty; flo = 1; fhi = 0 }
 
 (* -- comparison and hashing ------------------------------------------------ *)
 
@@ -103,7 +113,8 @@ let node_equal (a : node) (b : node) =
 type table =
   { mutable buckets : t Weak.t array
   ; mutable size : int
-    (* entries added since the last resize; exact live count right after one *)
+    (* live entries at the last resize, plus insertions since; exact
+       live count right after one *)
   }
 
 let min_buckets = 16
@@ -143,30 +154,60 @@ let bucket_put (buckets : t Weak.t array) i (v : t) =
     buckets.(i) <- b')
 ;;
 
-(* Rebuild the bucket array at double the size, dropping the dead
-   entries and re-placing the live ones. *)
-let rehash tbl =
-  let old = tbl.buckets in
-  let n' = min (Array.length old * 2) (Sys.max_array_length - 1) in
-  if n' > Array.length old
-  then (
-    let fresh = Array.make n' (Weak.create 0) in
-    let live = ref 0 in
-    Array.iter
-      (fun b ->
-         for j = 0 to Weak.length b - 1 do
-           match Weak.get b j with
-           | Some v ->
-             bucket_put fresh (bucket_index (node_hash v.node) n') v;
-             incr live
-           | None -> ()
-         done)
-      old;
-    tbl.buckets <- fresh;
-    tbl.size <- !live)
+let live_count (buckets : t Weak.t array) =
+  let live = ref 0 in
+  Array.iter
+    (fun b ->
+       for j = 0 to Weak.length b - 1 do
+         if Weak.check b j then incr live
+       done)
+    buckets;
+  !live
 ;;
 
-let table = make_table 1024
+(* One bucket per live entry, rounded up to a power of two. That is the
+   occupancy the doubling policy settled at anyway; the difference is
+   that it can now be reached from above. *)
+let buckets_for live =
+  let cap = Sys.max_array_length - 1 in
+  let rec pow2 k = if k >= live || k * 2 > cap then k else pow2 (k * 2) in
+  pow2 min_buckets
+;;
+
+let rebuild tbl n' =
+  let old = tbl.buckets in
+  let fresh = Array.make n' (Weak.create 0) in
+  Array.iter
+    (fun b ->
+       for j = 0 to Weak.length b - 1 do
+         match Weak.get b j with
+         | Some v -> bucket_put fresh (bucket_index (node_hash v.node) n') v
+         | None -> ()
+       done)
+    old;
+  tbl.buckets <- fresh
+;;
+
+(* Resize from the entries that are still live rather than from the
+   number interned since the last resize. Entries die on their own,
+   being weak, so the table shrinks here as readily as it grows: this
+   is where it learns how much of itself is still in use. Rehashing
+   costs [O(buckets + live)] and leaves room for [live] more insertions
+   before the next one, so it stays amortised constant. *)
+let rehash tbl =
+  let live = live_count tbl.buckets in
+  let n' = buckets_for live in
+  if n' <> Array.length tbl.buckets then rebuild tbl n';
+  (* [size] is now live-at-last-resize plus insertions since, so the
+     next resize is triggered by growth in live entries rather than by
+     cumulative interning. *)
+  tbl.size <- live
+;;
+
+(* Also the size [clear_cache] returns to. *)
+let initial_buckets = 1024
+
+let table = make_table initial_buckets
 let next_tag = ref 0
 
 (* Every child of [n] is interned by the time we get here, so
@@ -204,9 +245,7 @@ let intern (n : node) : t =
       ; node = n
       ; nullable = nullable_of n
       ; approx = None
-      ; first = None
-      ; f_lo = 1
-      ; f_hi = 0
+      ; first = no_fmemo
       }
     in
     incr next_tag;
@@ -221,6 +260,39 @@ let intern (n : node) : t =
 let empty = intern (Chars Ucharset.empty)
 let eps = intern (Seq [])
 let any = intern (Chars Ucharset.all)
+
+(* Drop every entry and return the bucket array to its initial size.
+
+   [rehash] re-measures the table only when something is interned, so a
+   program that builds a large automaton, drops it and then stops
+   interning holds the array at its peak for the rest of its life.
+   Since the table is global there is nothing for the caller to release
+   instead, so this is the release.
+
+   The three constants above are put back, being reachable for the life
+   of the program either way: without that, interning [Chars empty]
+   again would mint a second record and the [empty] [deriv] returns
+   would stop being the [empty] a caller holds.
+
+   Nothing else is. A node interned before the call and one interned
+   after are separate records even when structurally equal, so [equal]
+   answers false for the pair and the [Alt]/[Inter] canonical form,
+   which is maintained by tag, no longer holds across the boundary.
+   Tags themselves stay unique — the counter is untouched — so nothing
+   is mistaken for anything else. Call this only once every regex and
+   DFA built so far has been dropped.
+
+   {!Siesta.Cache.clear} is the same operation on a cache the caller
+   owns, which is the sounder shape; here the table is global. *)
+let clear_cache () =
+  table.buckets <- Array.make initial_buckets (Weak.create 0);
+  table.size <- 0;
+  List.iter
+    (fun v ->
+       bucket_put table.buckets (bucket_index (node_hash v.node) initial_buckets) v;
+       table.size <- table.size + 1)
+    [ empty; eps; any ]
+;;
 
 let is_empty (t : t) =
   match t.node with
@@ -512,10 +584,10 @@ let opt t = alt t eps
    Computed on first use and cached on the node.
    -------------------------------------------------------------------------- *)
 
-let rec first_set (r : t) =
-  match r.first with
-  | Some c -> c
-  | None ->
+let rec fmemo_of (r : t) =
+  if r.first != no_fmemo
+  then r.first
+  else (
     let c =
       match r.node with
       | Chars c -> c
@@ -537,25 +609,26 @@ let rec first_set (r : t) =
       | Not _ -> Ucharset.all
       | Star x -> first_set x
     in
-    r.first <- Some c;
-    (* Bounds for the guard in [deriv]. An empty first set leaves
-       the initial [1 > 0], rejecting every codepoint. *)
-    (match Ucharset.min_elt_opt c, Ucharset.max_elt_opt c with
-     | Some lo, Some hi ->
-       r.f_lo <- lo;
-       r.f_hi <- hi
-     | _ -> ());
-    c
-;;
+    (* Bounds for the guard in [deriv]. An empty first set keeps the
+       sentinel's [1 > 0], rejecting every codepoint. *)
+    let m =
+      match Ucharset.min_elt_opt c, Ucharset.max_elt_opt c with
+      | Some lo, Some hi -> { fs = c; flo = lo; fhi = hi }
+      | _ -> { fs = c; flo = 1; fhi = 0 }
+    in
+    r.first <- m;
+    m)
+
+and first_set (r : t) = (fmemo_of r).fs
 
 (* Two integer comparisons against the first set's bounds reject a
-   codepoint outside it. [f_lo = f_hi] is a single codepoint first
+   codepoint outside it. [flo = fhi] is a single codepoint first
    set, where the bounds have already settled membership. *)
-let rec deriv (r : t) ~uchr =
-  let c = first_set r in
-  if uchr < r.f_lo || uchr > r.f_hi
+and deriv (r : t) ~uchr =
+  let m = fmemo_of r in
+  if uchr < m.flo || uchr > m.fhi
   then empty
-  else if r.f_lo = r.f_hi || Ucharset.mem c uchr
+  else if m.flo = m.fhi || Ucharset.mem m.fs uchr
   then deriv_node r ~uchr
   else empty
 

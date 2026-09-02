@@ -203,10 +203,11 @@ let of_tokens (token_regexes : (int * Regex.t) list) : t =
 
 (* -- minimisation -------------------------------------------------------------
 
-   Moore's partition refinement. States start grouped by [accepts].
-   Each pass keeps two together when their previous block and their
-   outgoing transition signature both match, and passes only split, so
-   the block count climbs until it settles or every state sits alone.
+   Moore's partition refinement, over an automaton trimmed of its dead
+   states first. States start grouped by [accepts]. Each pass keeps
+   two together when their previous block and their outgoing
+   transition signature both match, and passes only split, so the
+   block count climbs until it settles or every state sits alone.
 
    Construction collapses residuals that agree up to associativity,
    commutativity and idempotence, so the states arriving here are
@@ -214,6 +215,143 @@ let of_tokens (token_regexes : (int * Regex.t) list) : t =
    language through different structure, and those are what this pass
    merges.
    -------------------------------------------------------------------------- *)
+
+(* The states some accepting state is reachable from. Everything else
+   has an empty residual language: it accepts nothing, and no path out
+   of it reaches anything that does.
+
+   Backward breadth-first from the accepting states. Only the edges
+   leaving a non-accepting state are reversed: a state that accepts
+   something is live from the outset, so nothing is ever discovered
+   through it, and on a lexer's automaton most states accept. The
+   reverse edges go into three int arrays -- a counting sort over the
+   destinations -- and the frontier into a fourth, so the scan
+   allocates four flat arrays and nothing per edge. It runs on every
+   [minimise], including the ones with nothing dead to find, which is
+   what makes both economies worth having. *)
+let live_states (dfa : t) =
+  let n = dfa.num_states in
+  let live = Array.make n false in
+  let frontier = Array.make n 0 in
+  let top = ref 0 in
+  let discoverable = ref 0 in
+  for id = 0 to n - 1 do
+    match dfa.accepts.(id) with
+    | [] -> incr discoverable
+    | _ ->
+      live.(id) <- true;
+      frontier.(!top) <- id;
+      incr top
+  done;
+  if !discoverable = 0
+  then live
+  else (
+    (* [start.(i) .. start.(i + 1) - 1] indexes [preds] for state [i],
+       listing the non-accepting states with an edge into it. *)
+    let start = Array.make (n + 1) 0 in
+    let edges = ref 0 in
+    for id = 0 to n - 1 do
+      if not live.(id)
+      then
+        List.iter
+          (fun (_, dst) ->
+             incr edges;
+             start.(dst + 1) <- start.(dst + 1) + 1)
+          dfa.transitions.(id)
+    done;
+    for i = 0 to n - 1 do
+      start.(i + 1) <- start.(i + 1) + start.(i)
+    done;
+    let fill = Array.copy start in
+    let preds = Array.make (max 1 !edges) 0 in
+    for id = 0 to n - 1 do
+      if not live.(id)
+      then
+        List.iter
+          (fun (_, dst) ->
+             preds.(fill.(dst)) <- id;
+             fill.(dst) <- fill.(dst) + 1)
+          dfa.transitions.(id)
+    done;
+    while !top > 0 do
+      decr top;
+      let id = frontier.(!top) in
+      for k = start.(id) to start.(id + 1) - 1 do
+        let p = preds.(k) in
+        if not live.(p)
+        then (
+          live.(p) <- true;
+          frontier.(!top) <- p;
+          incr top)
+      done
+    done;
+    live)
+;;
+
+(* Drop the dead states and the edges into them. [None] when there are
+   none, which is the common case and not worth copying an automaton
+   for.
+
+   This stands in for the completion with a sink that Moore's
+   algorithm is stated over. Refinement reads the transitions as
+   stored, where "no transition on c" and "a transition on c into a
+   dead state" are different signatures for the same behaviour, so
+   with a dead state present it splits states that are equivalent and
+   the dead state and its in-edges survive the pass. Completing with a
+   sink reconciles the two, at the price of a state that has to be
+   split back out again -- a whole extra refinement pass on inputs
+   that would otherwise settle in one. Removing them up front reaches
+   the same partition: every state that remains reaches an accepting
+   state, so no two of them are separated by a difference only a sink
+   could have closed. *)
+let trim (dfa : t) : t option =
+  let n = dfa.num_states in
+  if n = 0
+  then None
+  else (
+    let live = live_states dfa in
+    let n_live = Array.fold_left (fun k b -> if b then k + 1 else k) 0 live in
+    if n_live = n
+    then None
+    else if not live.(0)
+    then
+      (* Nothing reachable accepts anything, so the language is empty
+         and its minimal automaton is the one state that goes nowhere.
+         Every state merges into it, and [reaches] at a merged state is
+         their union. *)
+      Some
+        { num_states = 1
+        ; accepts = [| [] |]
+        ; reaches = [| List.sort_uniq Int.compare (List.concat (Array.to_list dfa.reaches)) |]
+        ; transitions = [| [] |]
+        }
+    else (
+      (* Live states keep their relative order, so the initial state
+         stays state 0. *)
+      let renumber = Array.make n (-1) in
+      let next = ref 0 in
+      for id = 0 to n - 1 do
+        if live.(id)
+        then (
+          renumber.(id) <- !next;
+          incr next)
+      done;
+      let accepts = Array.make n_live [] in
+      let reaches = Array.make n_live [] in
+      let transitions = Array.make n_live [] in
+      for id = 0 to n - 1 do
+        if live.(id)
+        then (
+          let k = renumber.(id) in
+          accepts.(k) <- dfa.accepts.(id);
+          reaches.(k) <- dfa.reaches.(id);
+          transitions.(k)
+          <- List.filter_map
+               (fun (cs, dst) -> if live.(dst) then Some (cs, renumber.(dst)) else None)
+               dfa.transitions.(id))
+      done;
+      Some { num_states = n_live; accepts; reaches; transitions }))
+;;
 
 (* The refinement signature, a state's current block plus its
    outgoing transitions coalesced by destination block. Hashes and
@@ -243,7 +381,7 @@ end
 
 module Sig_table = Hashtbl.Make (Sig_key)
 
-let minimise (dfa : t) : t =
+let refine (dfa : t) : t =
   let n = dfa.num_states in
   if n <= 1
   then dfa
@@ -388,6 +526,10 @@ let minimise (dfa : t) : t =
       ; reaches = new_reaches
       ; transitions = new_transitions
       }))
+;;
+
+let minimise (dfa : t) : t =
+  refine (match trim dfa with Some trimmed -> trimmed | None -> dfa)
 ;;
 
 (* -- pretty-printing ------------------------------------------------------- *)
