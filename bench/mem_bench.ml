@@ -6,7 +6,9 @@
 
 (* [n] disjoint 4-wide ranges, spaced so they never coalesce. *)
 let set_of_n n =
-  Ucharset.union_list (List.init n (fun i -> Ucharset.range ~lo:(0x20000 + (i * 8)) ~hi:(0x20000 + (i * 8) + 3)))
+  Ucharset.union_list
+    (List.init n (fun i ->
+       Ucharset.range ~lo:(0x20000 + (i * 8)) ~hi:(0x20000 + (i * 8) + 3)))
 ;;
 
 (* Probes that mostly miss, which is the pruned-guard case. *)

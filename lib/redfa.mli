@@ -86,6 +86,12 @@ module Ast : sig
   val chars : Ucharset.t -> t
   val singleton : int -> t
   val range : lo:int -> hi:int -> t
+
+  (* The codepoints of [s], decoded as UTF-8, in sequence. Raises
+     [Invalid_argument] on malformed UTF-8, which is the input
+     {!Regex.of_string} answers [Error] on; taking it would decode the
+     bad bytes to U+FFFD and denote a term the caller did not
+     write. *)
   val str : string -> t
   val seq : t -> t -> t
   val seqs : t list -> t
@@ -172,6 +178,7 @@ module Regex : sig
   val range : lo:int -> hi:int -> t
   val range_char : lo:char -> hi:char -> t
   val range_uchar : lo:Uchar.t -> hi:Uchar.t -> t
+
   (* Any single codepoint outside the set, the [\[^...\]] of a
      source. *)
   val not_chars : Ucharset.t -> t
@@ -184,13 +191,11 @@ module Regex : sig
 
   (* Any of the listed codepoints. *)
   val chars_of_list : int list -> t
-
   val chars_of_char_list : char list -> t
   val chars_of_uchar_list : Uchar.t list -> t
 
   (* Any codepoint inside any of the inclusive ranges. *)
   val chars_in_ranges : (int * int) list -> t
-
   val chars_in_char_ranges : (char * char) list -> t
   val chars_in_uchar_ranges : (Uchar.t * Uchar.t) list -> t
 
@@ -198,7 +203,6 @@ module Regex : sig
      ranges. The trailing [unit] guards against a partial application
      when both labels are left off. *)
   val one_of : ?singles:int list -> ?ranges:(int * int) list -> unit -> t
-
   val one_of_char : ?singles:char list -> ?ranges:(char * char) list -> unit -> t
 
   val one_of_uchar
@@ -207,9 +211,11 @@ module Regex : sig
     -> unit
     -> t
 
-  (* The codepoints of [s], decoded as UTF-8, in sequence. *)
+  (* The codepoints of [s], decoded as UTF-8, in sequence. Raises
+     [Invalid_argument] on malformed UTF-8, which is the input
+     {!of_string} answers [Error] on; taking it would decode the bad
+     bytes to U+FFFD and denote a term the caller did not write. *)
   val str : string -> t
-
   val seq : t -> t -> t
   val seqs : t list -> t
   val alt : t -> t -> t
@@ -225,7 +231,6 @@ module Regex : sig
      A negated character class is {!not_chars} and its friends, or
      [\[^a\]] in a source. *)
   val complement : t -> t
-
   val inter : t -> t -> t
   val inters : t list -> t
 
@@ -261,9 +266,11 @@ module Regex : sig
 
   (* -- lowering and comparison --------------------------------------------- *)
 
-  (* The source form {!of_string} reads back. *)
+  (* The source form {!of_string} reads back. Total over the type, the
+     constructors being public: [Alt \[\]] goes out as the empty
+     language and [Inter \[\]] as [.*], which is what {!to_ast} makes
+     of them. *)
   val to_string : t -> string
-
   val to_ast : t -> Ast.t
 
   (* Whether two regexes denote the same language up to the normal
@@ -278,7 +285,14 @@ module Regex : sig
      language. *)
   val to_oniguruma : t -> (string, string) result
 
-  (* -- pretty-printing ----------------------------------------------------- *)
+  (* -- pretty-printing --------------------------------------------------------
+
+     A debug view, not source: character sets print as {!Ucharset.pp}
+     writes them, [Eps] as an epsilon, an empty [Alt] and an empty
+     [Inter] as their languages. A [Neg_chars] takes a [^] prefix and a
+     [Complement] a [~], so the two negations are told apart, and the
+     [^] parenthesises like the [~]. Use {!to_string} for source.
+     ------------------------------------------------------------------------ *)
 
   val pp : Format.formatter -> t -> unit
 end
@@ -314,7 +328,6 @@ module Dfa : sig
 
   (* Always 0, for symmetry with {!num_states}. *)
   val initial : t -> state_id
-
   val num_states : t -> int
 
   (* Case ids whose regex is nullable in this state, in ascending
@@ -333,7 +346,6 @@ module Dfa : sig
 
   (* Accepts nothing and goes nowhere. *)
   val is_dead : t -> state_id -> bool
-
   val iter_states : t -> (state_id -> unit) -> unit
 
   (* The smallest DFA accepting the same tokens. Two things happen:
@@ -356,6 +368,5 @@ module Dfa : sig
      the empty language, which is a single dead state because an
      automaton still needs an initial one. Idempotent. *)
   val minimise : t -> t
-
   val pp : Format.formatter -> t -> unit
 end

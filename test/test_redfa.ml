@@ -168,7 +168,9 @@ let () =
     if Ast.is_alt r
     then (
       let xs = Ast.alt_children r in
-      check "Alt sorted distinct" (List.map Ast.tag xs = List.map Ast.tag (Ast.sort_distinct xs));
+      check
+        "Alt sorted distinct"
+        (List.map Ast.tag xs = List.map Ast.tag (Ast.sort_distinct xs));
       check "Alt length >= 2" (List.length xs >= 2);
       check "Alt no empty child" (not (List.exists Ast.is_empty xs));
       check "Alt no nested Alt" (not (List.exists Ast.is_alt xs));
@@ -208,7 +210,9 @@ let () =
     [ "a(", 1; "a)b", 1; "[a-", 0; "*a", 0; "[z-a]", 1; "\\q", 0; "[]", 0; "a\\", 1 ];
   (* Shapes the grammar has to get right. *)
   let same src t = check ("of_string " ^ src) (of_string src = Ok t) in
-  let a = singleton_char 'a' and b = singleton_char 'b' and c = singleton_char 'c' in
+  let a = singleton_char 'a'
+  and b = singleton_char 'b'
+  and c = singleton_char 'c' in
   same "abc" (seqs [ a; b; c ]);
   same "a|bc" (alts [ a; seq b c ]);
   same "(a|b)c" (seq (alts [ a; b ]) c);
@@ -273,7 +277,9 @@ let round_trips ~alphabet ~seed ~n =
     let src = to_string r in
     (match of_string src with
      | Error e ->
-       check (Printf.sprintf "to_string produced unparseable source %S: %s" src e.msg) false
+       check
+         (Printf.sprintf "to_string produced unparseable source %S: %s" src e.msg)
+         false
      | Ok back -> check (Printf.sprintf "round trip %S" src) (equivalent r back));
     (* Oniguruma output is a subset of the same syntax, once [(?:] is
        read as a group. *)
@@ -281,9 +287,9 @@ let round_trips ~alphabet ~seed ~n =
     | Error _ -> ()
     | Ok oni ->
       (match of_string oni with
-       | Error e ->
-         check (Printf.sprintf "oniguruma %S unparseable: %s" oni e.msg) false
-       | Ok back -> check (Printf.sprintf "oniguruma round trip %S" oni) (equivalent r back))
+       | Error e -> check (Printf.sprintf "oniguruma %S unparseable: %s" oni e.msg) false
+       | Ok back ->
+         check (Printf.sprintf "oniguruma round trip %S" oni) (equivalent r back))
   done
 ;;
 
@@ -307,7 +313,9 @@ let () =
        | Ok oni ->
          (match of_string oni with
           | Error e ->
-            check (Printf.sprintf "literal U+%04X emits unparseable %S: %s" cp oni e.msg) false
+            check
+              (Printf.sprintf "literal U+%04X emits unparseable %S: %s" cp oni e.msg)
+              false
           | Ok back ->
             check
               (Printf.sprintf "literal U+%04X survives oniguruma as %S" cp oni)
@@ -326,8 +334,167 @@ let () =
              | Error e ->
                check (Printf.sprintf "%S -> oniguruma %S: %s" src oni e.msg) false
              | Ok back ->
-               check (Printf.sprintf "%S -> oniguruma %S round trips" src oni) (equivalent r back))))
+               check
+                 (Printf.sprintf "%S -> oniguruma %S round trips" src oni)
+                 (equivalent r back))))
     [ "\\&"; "a\\&b"; "\\~"; "\\~*"; "a\\&b|\\~" ]
+;;
+
+(* -- the printers over the whole public type ------------------------------- *)
+
+(* [=] on a [Regex.t] compares the [Ucharset.t] payloads structurally.
+   Set equality is what is wanted here, so go through [Ucharset.equal]
+   rather than trusting the two to agree. *)
+let rec same_regex a b =
+  match a, b with
+  | Chars x, Chars y | Neg_chars x, Neg_chars y -> Ucharset.equal x y
+  | Eps, Eps -> true
+  | Seq xs, Seq ys | Alt xs, Alt ys | Inter xs, Inter ys ->
+    List.length xs = List.length ys && List.for_all2 same_regex xs ys
+  | Star x, Star y | Plus x, Plus y | Opt x, Opt y | Complement x, Complement y ->
+    same_regex x y
+  | _ -> false
+;;
+
+(* [pp] breaks at the formatter's margin, so widen it: this compares
+   renderings, not layouts. *)
+let pp_string t =
+  let buf = Buffer.create 64 in
+  let ppf = Format.formatter_of_buffer buf in
+  Format.pp_set_margin ppf 1_000_000;
+  Format.fprintf ppf "%a" pp t;
+  Format.pp_print_flush ppf ();
+  Buffer.contents buf
+;;
+
+(* [pp] is a debug view, so its one job is to say which node you are
+   holding. That is injectivity: two terms sharing a rendering means
+   the rendering does not identify either. Both of the review's cases
+   are collisions of exactly that shape --- [Neg_chars c] against
+   [Complement (Chars c)], and [Star (Neg_chars c)] against
+   [Complement (Star (Chars c))], the second because the prefix [~] was
+   printed at atom precedence and so was never parenthesised. *)
+let pp_injective ~alphabet ~seed ~n =
+  let st = Random.State.make [| seed |] in
+  let seen = Hashtbl.create 4096 in
+  let collisions = ref 0 in
+  for _ = 1 to n do
+    let r, _ = gen ~alphabet st 3 in
+    let rendered = pp_string r in
+    match Hashtbl.find_opt seen rendered with
+    | Some prev ->
+      if not (same_regex prev r)
+      then (
+        if !collisions = 0 then Printf.printf "  first pp collision: %s\n" rendered;
+        incr collisions)
+    | None -> Hashtbl.add seen rendered r
+  done;
+  check
+    (Printf.sprintf
+       "pp is injective (seed %d: %d renderings, %d collisions)"
+       seed
+       (Hashtbl.length seen)
+       !collisions)
+    (!collisions = 0)
+;;
+
+let () =
+  pp_injective ~alphabet ~seed:31337 ~n:20_000;
+  pp_injective ~alphabet:meta_alphabet ~seed:90210 ~n:20_000;
+  (* The review's reproductions, named. *)
+  let a = Ucharset.singleton_char 'a' in
+  check
+    "pp tells a negated class from a complemented one"
+    (pp_string (Neg_chars a) <> pp_string (Complement (Chars a)));
+  check
+    "pp parenthesises a starred negated class"
+    (pp_string (Star (Neg_chars a)) <> pp_string (Complement (Star (Chars a))));
+  (* Empty [Alt] and empty [Inter] printed as nothing, which is what a
+     [Seq] of nothing prints and is the language of [eps], not theirs. *)
+  check "pp tells the empty language from eps" (pp_string (Alt []) <> pp_string Eps);
+  check
+    "pp tells the empty language from an empty Seq"
+    (pp_string (Alt []) <> pp_string (Seq []));
+  check "pp tells an empty Inter from eps" (pp_string (Inter []) <> pp_string Eps);
+  check "pp tells the two empty lists apart" (pp_string (Alt []) <> pp_string (Inter []))
+;;
+
+(* [to_string] is documented as the source [of_string] reads back, and
+   the constructors are public, so it has to be total over the type.
+   [Alt \[\]] is the empty language and [Inter \[\]] is every string;
+   both used to render as the empty source, which reads back as
+   [eps]. *)
+let () =
+  let a = Chars (Ucharset.singleton_char 'a') in
+  let reads_back name t =
+    let src = to_string t in
+    match of_string src with
+    | Error e ->
+      check (Printf.sprintf "%s: to_string gave unparseable %S: %s" name src e.msg) false
+    | Ok back ->
+      check (Printf.sprintf "%s reads back from %S" name src) (equivalent t back)
+  in
+  List.iter
+    (fun (name, t) -> reads_back name t)
+    [ "Alt []", Alt []
+    ; "Inter []", Inter []
+    ; "Star (Alt [])", Star (Alt [])
+    ; "Star (Inter [])", Star (Inter [])
+    ; "Complement (Alt [])", Complement (Alt [])
+    ; "Seq [Alt []; a]", Seq [ Alt []; a ]
+    ; "Seq [Inter []; a]", Seq [ Inter []; a ]
+    ; "Alt [Inter []; a]", Alt [ Inter []; a ]
+    ; "Inter [Inter []; a]", Inter [ Inter []; a ]
+    ; "Alt [Alt []; a]", Alt [ Alt []; a ]
+    ];
+  (* [equivalent] would be satisfied by any two terms that agree, so
+     pin the languages the two empty lists denote as well. *)
+  check "Alt [] is the empty language" (not (Ast.eval (to_ast (Alt [])) ""));
+  check "Alt [] matches nothing at all" (not (Ast.eval (to_ast (Alt [])) "a"));
+  check "Inter [] takes the empty string" (Ast.eval (to_ast (Inter [])) "");
+  check "Inter [] takes any string" (Ast.eval (to_ast (Inter [])) "abc")
+;;
+
+(* -- str rejects the bytes of_string rejects ------------------------------- *)
+
+(* [String.get_utf_8_uchar] answers U+FFFD on a bad byte instead of
+   failing, so [str] used to build a term the caller did not write,
+   silently, over input the parser refuses. *)
+let () =
+  List.iter
+    (fun s ->
+       check
+         (Printf.sprintf "of_string rejects %S" s)
+         (match of_string s with
+          | Error e -> e.msg = "malformed UTF-8"
+          | Ok _ -> false);
+       check
+         (Printf.sprintf "Regex.str rejects %S" s)
+         (match str s with
+          | exception Invalid_argument _ -> true
+          | _ -> false);
+       check
+         (Printf.sprintf "Ast.str rejects %S" s)
+         (match Ast.str s with
+          | exception Invalid_argument _ -> true
+          | _ -> false))
+    [ "\xff\xfe" (* not UTF-8 at all *)
+    ; "\xc3" (* truncated two byte sequence *)
+    ; "\xe0\xa4" (* truncated three byte sequence *)
+    ; "\x80" (* a lone continuation byte *)
+    ; "\xed\xa0\x80" (* a surrogate, ill formed in UTF-8 *)
+    ; "\xf4\x90\x80\x80" (* above U+10FFFF *)
+    ];
+  (* Only the malformed input is refused. A well formed U+FFFD is a
+     codepoint like any other and still goes through. *)
+  let fffd = "\xef\xbf\xbd" in
+  check "Regex.str keeps a real U+FFFD" (Ast.eval (to_ast (str fffd)) fffd);
+  check "Ast.str keeps a real U+FFFD" (Ast.eval (Ast.str fffd) fffd);
+  check
+    "Regex.str still takes valid text"
+    (Ast.eval (to_ast (str "\xce\xbbx")) "\xce\xbbx");
+  check "Ast.str still takes valid text" (Ast.eval (Ast.str "\xce\xbbx") "\xce\xbbx");
+  check "str of the empty string is eps" (is_eps (str ""))
 ;;
 
 (* -- the first-set guard never rejects a live codepoint --------------------- *)
@@ -381,9 +548,9 @@ let () =
   (* Supplementary plane, four bytes. *)
   let deseret = "\xf0\x90\x90\x80" in
   check "supplementary codepoint" (matches (singleton 0x10400) deseret);
-  check "supplementary in a range"
-    (matches (range ~lo:0x10000 ~hi:0x10FFFF) deseret);
-  check "round trips through source"
+  check "supplementary in a range" (matches (range ~lo:0x10000 ~hi:0x10FFFF) deseret);
+  check
+    "round trips through source"
     (match of_string (to_string (singleton 0x10400)) with
      | Ok r -> matches r deseret
      | Error _ -> false)
@@ -434,7 +601,9 @@ let dfa_accepts dfa cps =
   let rec go id = function
     | [] -> Dfa.accepts dfa id
     | cp :: rest ->
-      (match List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id) with
+      (match
+         List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id)
+       with
        | None -> []
        | Some (_, dst) -> go dst rest)
   in
@@ -454,7 +623,8 @@ let same_dfa a b =
     then ok := false
     else
       List.iter2
-        (fun (c1, d1) (c2, d2) -> if not (Ucharset.equal c1 c2 && d1 = d2) then ok := false)
+        (fun (c1, d1) (c2, d2) ->
+           if not (Ucharset.equal c1 c2 && d1 = d2) then ok := false)
         ta
         tb);
   !ok
@@ -586,8 +756,9 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
   let corp = cp_corpus ~alphabet ~len in
   for _ = 1 to trials do
     let tokens =
-      List.init (1 + Random.State.int st max_tokens) (fun i ->
-        i, fst (gen ~alphabet st depth))
+      List.init
+        (1 + Random.State.int st max_tokens)
+        (fun i -> i, fst (gen ~alphabet st depth))
     in
     let dfa = Dfa.of_tokens tokens in
     let mini = Dfa.minimise dfa in
@@ -610,7 +781,9 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
        dead state", so dead states and their in-edges survived: about
        one random rule set in ten came out above the minimum. *)
     let reference = reference_min dfa in
-    check (name "minimise reaches the minimum") (Dfa.num_states mini = reference.min_states);
+    check
+      (name "minimise reaches the minimum")
+      (Dfa.num_states mini = reference.min_states);
     check (name "minimise is idempotent") (same_dfa mini (Dfa.minimise mini));
     (* Nothing dead survives, the one exception being the automaton
        that is nothing but a dead state. *)
@@ -626,9 +799,15 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
       Dfa.iter_states a (fun id ->
         let acc = Dfa.accepts a id
         and rch = Dfa.reaches a id in
-        check (name (what ^ " reaches covers accepts")) (List.for_all (fun c -> List.mem c rch) acc);
-        check (name (what ^ " reaches ascending and distinct")) (rch = List.sort_uniq Int.compare rch);
-        check (name (what ^ " accepts ascending and distinct")) (acc = List.sort_uniq Int.compare acc);
+        check
+          (name (what ^ " reaches covers accepts"))
+          (List.for_all (fun c -> List.mem c rch) acc);
+        check
+          (name (what ^ " reaches ascending and distinct"))
+          (rch = List.sort_uniq Int.compare rch);
+        check
+          (name (what ^ " accepts ascending and distinct"))
+          (acc = List.sort_uniq Int.compare acc);
         check
           (name (what ^ " is_dead agrees with accepts and transitions"))
           (Dfa.is_dead a id = (acc = [] && Dfa.transitions a id = []));
@@ -643,7 +822,9 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
             && disjoint rest
         in
         check (name (what ^ " transitions disjoint")) (disjoint css);
-        check (name (what ^ " no empty transition label")) (not (List.exists Ucharset.is_empty css));
+        check
+          (name (what ^ " no empty transition label"))
+          (not (List.exists Ucharset.is_empty css));
         let mins = List.filter_map Ucharset.min_elt_opt css in
         check (name (what ^ " labels ascending")) (mins = List.sort Int.compare mins))
     in
@@ -667,7 +848,7 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
       Dfa.iter_states dfa (fun id ->
         check
           (name "a state is dropped exactly when it is dead")
-          ((map.(id) = -1) = reference.dead.(id));
+          (map.(id) = -1 = reference.dead.(id));
         if map.(id) <> -1
         then (
           check
@@ -685,10 +866,22 @@ let () =
   (* The single-byte alphabet the suite has always used, over every
      string of up to three characters. *)
   check_dfa ~label:"ascii" ~alphabet ~len:3 ~seed:99 ~trials:400 ~depth:3 ~max_tokens:4;
-  check_dfa ~label:"ascii deep" ~alphabet ~len:3 ~seed:20260902 ~trials:150 ~depth:5
+  check_dfa
+    ~label:"ascii deep"
+    ~alphabet
+    ~len:3
+    ~seed:20260902
+    ~trials:150
+    ~depth:5
     ~max_tokens:3;
   (* The same, outside the BMP and across the surrogate boundaries. *)
-  check_dfa ~label:"wide" ~alphabet:wide_alphabet ~len:3 ~seed:4711 ~trials:150 ~depth:3
+  check_dfa
+    ~label:"wide"
+    ~alphabet:wide_alphabet
+    ~len:3
+    ~seed:4711
+    ~trials:150
+    ~depth:3
     ~max_tokens:3
 ;;
 
@@ -701,8 +894,12 @@ let () =
 let () =
   let d =
     Dfa.of_tokens
-      [ 0, seq (singleton_char 'a') (inter (seq (singleton_char 'b') (star any))
-                                       (seq (singleton_char 'c') (star any)))
+      [ ( 0
+        , seq
+            (singleton_char 'a')
+            (inter
+               (seq (singleton_char 'b') (star any))
+               (seq (singleton_char 'c') (star any))) )
       ; 1, singleton_char 'd'
       ]
   in
@@ -716,8 +913,10 @@ let () =
   check "and the survivor is the one that accepts" (Dfa.accepts m 1 = [ 1 ]);
   (* A whole language that is empty keeps its one state, since an
      automaton has to have an initial one. *)
-  let e = Dfa.minimise (Dfa.of_tokens [ 0, inter (singleton_char 'a')
-                                             (complement (singleton_char 'a')) ]) in
+  let e =
+    Dfa.minimise
+      (Dfa.of_tokens [ 0, inter (singleton_char 'a') (complement (singleton_char 'a')) ])
+  in
   check "an empty language is one dead state" (Dfa.num_states e = 1 && Dfa.is_dead e 0)
 ;;
 

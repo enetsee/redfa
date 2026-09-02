@@ -322,7 +322,8 @@ let trim (dfa : t) : t option =
       Some
         { num_states = 1
         ; accepts = [| [] |]
-        ; reaches = [| List.sort_uniq Int.compare (List.concat (Array.to_list dfa.reaches)) |]
+        ; reaches =
+            [| List.sort_uniq Int.compare (List.concat (Array.to_list dfa.reaches)) |]
         ; transitions = [| [] |]
         }
     else (
@@ -529,7 +530,10 @@ let refine (dfa : t) : t =
 ;;
 
 let minimise (dfa : t) : t =
-  refine (match trim dfa with Some trimmed -> trimmed | None -> dfa)
+  refine
+    (match trim dfa with
+     | Some trimmed -> trimmed
+     | None -> dfa)
 ;;
 
 (* -- pretty-printing ------------------------------------------------------- *)

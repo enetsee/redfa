@@ -206,7 +206,6 @@ let rehash tbl =
 
 (* Also the size [clear_cache] returns to. *)
 let initial_buckets = 1024
-
 let table = make_table initial_buckets
 let next_tag = ref 0
 
@@ -438,6 +437,9 @@ let str s =
   and n = String.length s in
   while !i < n do
     let d = String.get_utf_8_uchar s !i in
+    (* U+FFFD is what a bad byte decodes to, so accepting it silently
+       builds a different regex. Raise instead, as the parser does. *)
+    if not (Uchar.utf_decode_is_valid d) then invalid_arg "Redfa.Ast.str: malformed UTF-8";
     cps := singleton (Uchar.to_int (Uchar.utf_decode_uchar d)) :: !cps;
     i := !i + Uchar.utf_decode_length d
   done;

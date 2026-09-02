@@ -114,12 +114,18 @@ let one_of_uchar ?(singles = []) ?(ranges = []) () =
        (ranges_set (fun lo hi -> Ucharset.range_uchar ~lo ~hi) ranges))
 ;;
 
+(* [String.get_utf_8_uchar] answers U+FFFD on a bad byte rather than
+   failing, which would make [str] silently denote a regex the caller
+   did not write. [of_string] rejects the same bytes, so this does
+   too. *)
 let str s =
   let cs = ref []
   and i = ref 0
   and n = String.length s in
   while !i < n do
     let d = String.get_utf_8_uchar s !i in
+    if not (Uchar.utf_decode_is_valid d)
+    then invalid_arg "Redfa.Regex.str: malformed UTF-8";
     cs := singleton (Uchar.to_int (Uchar.utf_decode_uchar d)) :: !cs;
     i := !i + Uchar.utf_decode_length d
   done;
@@ -169,7 +175,13 @@ let alts ts =
      (singleton_char 'b')] emits [\[ab\]]. [Neg_chars] children stay as
      they are: folding one through its complement turns [\[^b\]] into a
      class spanning the codespace. *)
-  let positives = List.filter_map (function Chars c -> Some c | _ -> None) nonemp in
+  let positives =
+    List.filter_map
+      (function
+        | Chars c -> Some c
+        | _ -> None)
+      nonemp
+  in
   let nonemp =
     match positives with
     | [] | [ _ ] -> nonemp
@@ -334,7 +346,6 @@ type cursor =
 let fail_at pos msg = raise (Fail { pos; msg })
 let fail c msg = fail_at c.at msg
 let eof c = c.at >= String.length c.src
-
 let peek c = if eof c then None else Some (String.unsafe_get c.src c.at)
 
 let bump c =
@@ -410,9 +421,11 @@ let parse_escape_cp c =
   | '0' -> Some 0x00
   | 'u' -> Some (parse_unicode_escape c)
   | 'd' | 'w' | 's' | 'D' | 'W' | 'S' -> None
-  | ch when (not (Char.code ch >= 0x30 && Char.code ch <= 0x39))
-            && Char.code ch < 0x80
-            && not ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) -> Some (Char.code ch)
+  | ch
+    when (not (Char.code ch >= 0x30 && Char.code ch <= 0x39))
+         && Char.code ch < 0x80
+         && not ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) ->
+    Some (Char.code ch)
   | ch -> fail_at start (Printf.sprintf "unknown escape \\%c" ch)
 ;;
 
@@ -678,6 +691,13 @@ let rec src prec buf t =
       then Buffer.add_char buf '.'
       else src_class ~negated:true buf cs
     | Eps -> Buffer.add_string buf "()"
+    (* An empty alternation is the empty language and an empty
+       intersection is every string, which is what [to_ast] gives
+       them. Neither is reachable through the smart constructors, but
+       both are constructible, and [sep] over no children would render
+       each as the empty source, which reads back as [eps]. *)
+    | Alt [] -> src_charset buf Ucharset.empty
+    | Inter [] -> Buffer.add_string buf ".*"
     | Seq xs -> sep None 3 xs
     | Alt xs -> sep (Some '|') 1 xs
     | Inter xs -> sep (Some '&') 2 xs
@@ -736,8 +756,22 @@ let cp_outside_charset buf cp =
      (* [&] and [~] are redfa's intersection and complement operators, so
         an unescaped one reparses as a different language, not a literal.
         Oniguruma takes a backslash before either as the character. *)
-     | '\\' | '.' | '[' | ']' | '(' | ')' | '{' | '}' | '*' | '+' | '?' | '|' | '^' | '$'
-     | '&' | '~' ->
+     | '\\'
+     | '.'
+     | '['
+     | ']'
+     | '('
+     | ')'
+     | '{'
+     | '}'
+     | '*'
+     | '+'
+     | '?'
+     | '|'
+     | '^'
+     | '$'
+     | '&'
+     | '~' ->
        Buffer.add_char buf '\\';
        Buffer.add_char buf c
      | _ -> Buffer.add_char buf c)
@@ -832,8 +866,7 @@ let rec emit_top buf c =
     else
       raise
         (Emission_failed
-           "an intersection over anything but character classes has no Oniguruma \
-            form")
+           "an intersection over anything but character classes has no Oniguruma form")
 
 and emit_factor buf c =
   match c with
@@ -871,16 +904,31 @@ let equivalent a b = Ast.equal (to_ast a) (to_ast b)
 
 (* -- pretty-printing ------------------------------------------------------- *)
 
+(* [src] writes [Neg_chars] as the atomic class source [[^...]], so
+   {!prec_of} ranks it with the atoms. [pp] writes it as a prefix [^]
+   instead, which binds and parenthesises like a [Complement]. The two
+   paths differ only here. *)
+let pp_prec_of = function
+  | Neg_chars _ -> 4
+  | t -> prec_of t
+;;
 
 let rec pp_prec prec ppf t =
-  let p = prec_of t in
+  let p = pp_prec_of t in
   if p < prec
   then Format.fprintf ppf "(%a)" (pp_prec 0) t
   else (
     match t with
     | Chars c -> Ucharset.pp ppf c
-    | Neg_chars c -> Format.fprintf ppf "~%a" Ucharset.pp c
+    (* [^] for the set complement, [~] for the language complement:
+       [Neg_chars c] and [Complement (Chars c)] denote different
+       things and used to print alike. *)
+    | Neg_chars c -> Format.fprintf ppf "^%a" Ucharset.pp c
     | Eps -> Format.fprintf ppf "ε"
+    (* Both would otherwise print as nothing, which is what [Seq []]
+       prints and is the language [eps], not these. *)
+    | Alt [] -> Format.fprintf ppf "∅"
+    | Inter [] -> Format.fprintf ppf "Σ*"
     | Seq xs ->
       Format.fprintf
         ppf
