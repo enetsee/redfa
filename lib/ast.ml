@@ -829,8 +829,8 @@ let uf_union uf a b =
    Skipping merged pairs is what beats the reachable product: one
    expansion per node at most, against one per pair of nodes. On
    automata both far from minimal that is [p + q] against [p * q].
-   [(a{63})*a*] against [(a{64})*a*], both [a*], is 127 pairs and 0.13
-   ms here against 4958 and 3.5 ms; level on the four token sets in
+   [(a{63})*a*] against [(a{64})*a*], both [a*], is 127 pairs and 0.11
+   ms here against 5192 and 3.3 ms; level on the four token sets in
    [bench], where the automata run in lockstep.
 
    Hopcroft & Karp, "A Linear Algorithm for Testing Equivalence of

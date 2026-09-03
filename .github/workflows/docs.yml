@@ -1,0 +1,56 @@
+name: Docs
+
+# Publishes odoc output to https://enetsee.github.io/redfa/, a project site
+# served from this repository's own Pages deployment and occupying the
+# /redfa/ subpath.
+#
+# Requires Settings > Pages > Source = "GitHub Actions" on this repository.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a running one is allowed to finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.4"
+
+      # ucharset is not on opam yet. Drop this once it is published.
+      - run: opam pin add ucharset https://github.com/enetsee/ucharset.git --no-action
+
+      - run: opam install . --deps-only --with-doc
+
+      - run: opam exec -- dune build @doc
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _build/default/_doc/_html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

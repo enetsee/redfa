@@ -753,7 +753,7 @@ let interval_endpoints cs =
 (* A member of [cs] at random: an interval at random, then a point
    inside it. Indexing the set itself would cost its cardinal. *)
 let random_member st cs =
-  let ivals = Array.of_list (Ucharset.to_list cs) in
+  let ivals = Array.of_list (Ucharset.to_intervals cs) in
   let lo, hi = ivals.(Random.State.int st (Array.length ivals)) in
   lo + Random.State.int st (hi - lo + 1)
 ;;
@@ -1267,7 +1267,7 @@ let () =
   check "a(b.*&c.*)|d minimises to two" (Dfa.num_states m = 2);
   check
     "the edge into the dead state goes with it"
-    (List.map (fun (cs, dst) -> Ucharset.to_list cs, dst) (Dfa.transitions m 0)
+    (List.map (fun (cs, dst) -> Ucharset.to_intervals cs, dst) (Dfa.transitions m 0)
      = [ [ Char.code 'd', Char.code 'd' ], 1 ]);
   check "and the survivor is the one that accepts" (Dfa.accepts m 1 = [ 1 ]);
   (* A whole language that is empty keeps its one state, since an
@@ -1489,7 +1489,7 @@ let () =
   check "eps is not" (not (is_empty_language eps));
   (* Two automata far from minimal, where the product is the size of
      the two multiplied and the traversal is their sum. Both are [a*],
-     as a 63-state cycle and a 64-state one: 4958 pairs as a product,
+     as a 63-state cycle and a 64-state one: 5192 pairs as a product,
      127 with the union-find. If the union-find ever stops collapsing
      them, this check takes far too long to finish. *)
   let a = singleton_char 'a' in
