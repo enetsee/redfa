@@ -149,7 +149,7 @@ module Ast : sig
      traverse one instead of building it: {!is_empty_language} looks
      for a nullable derivative, {!equivalent} is Hopcroft & Karp over
      pairs of them. Neither is bounded or interruptible; deciding
-     costs about what {!Dfa.of_tokens} costs, and [.{20}] is two
+     costs about what {!Dfa.of_tokens} costs, and [.*a.{20}] is two
      million states.
      ------------------------------------------------------------------------ *)
 
@@ -158,6 +158,18 @@ module Ast : sig
 
   (* Whether the two denote the same language. *)
   val equivalent : t -> t -> bool
+
+  (* The same two, given up on past [max_states] states of the
+     automaton being traversed: the derivatives visited for
+     {!is_empty_language_within}, the pairs merged for
+     {!equivalent_within}. [None] is "no answer within that" and not
+     an answer. Pass a bound on anything a caller did not write.
+
+     A bound of zero can still answer, where nothing has to be
+     traversed to know: [is_empty_language_within ~max_states:0 eps]
+     is [Some false], the root being nullable. *)
+  val is_empty_language_within : max_states:int -> t -> bool option
+  val equivalent_within : max_states:int -> t -> t -> bool option
 
   (* -- pretty-printing ----------------------------------------------------- *)
 
@@ -340,6 +352,11 @@ module Regex : sig
      equivalent term back is weaker than the same term back. *)
   val equivalent : t -> t -> bool
 
+  (* The same two under a state budget; see {!Ast.equivalent_within}.
+     [None] is "no answer within that" and not an answer. *)
+  val is_empty_language_within : max_states:int -> t -> bool option
+  val equivalent_within : max_states:int -> t -> t -> bool option
+
   (* -- emission ------------------------------------------------------------ *)
 
   (* Oniguruma source. [Error] where the term has no Oniguruma form: a
@@ -387,6 +404,15 @@ module Dfa : sig
      evolve separately under derivation, while {!accepts} and
      {!reaches} report each token at most once. *)
   val of_tokens : (int * Regex.t) list -> t
+
+  (* The same, [None] if the automaton would hold more than
+     [max_states] states. Construction is the operation here whose
+     cost a caller cannot see coming: [.*a.{20}] is two million
+     states, [.*a.{12}] is 8192, and a tower of complements and
+     intersections is non-elementary.
+     Pass a bound on anything a caller did not write. A bound below
+     one always gives [None], an automaton needing an initial state. *)
+  val of_tokens_within : max_states:int -> (int * Regex.t) list -> t option
 
   (* Always 0, for symmetry with {!num_states}. *)
   val initial : t -> state_id

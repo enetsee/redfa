@@ -127,7 +127,15 @@ let step_items items ~uchr =
   canonicalise_items (go [] items)
 ;;
 
-let of_tokens (token_regexes : (int * Regex.t) list) : t =
+(* Raised past the state budget and caught in {!of_tokens_within},
+   which discards the tables built so far, so {!of_tokens} needs no
+   failure case. *)
+exception Over_budget
+
+(* [max_states] caps the states of the result: one integer compare per
+   state discovered. Nothing does arithmetic on it, the unbounded form
+   passing [max_int] and [max_int + 1] being negative. *)
+let build (token_regexes : (int * Regex.t) list) ~max_states : t =
   let initial_items =
     canonicalise_items
       (List.filter_map
@@ -145,6 +153,7 @@ let of_tokens (token_regexes : (int * Regex.t) list) : t =
     | None ->
       let id = !next_id in
       incr next_id;
+      if !next_id > max_states then raise Over_budget;
       State_table.add state_id_of_key key id;
       vec_set key_of_id id key;
       id, true
@@ -199,6 +208,16 @@ let of_tokens (token_regexes : (int * Regex.t) list) : t =
   let reaches = Array.sub reaches_tbl.data 0 n in
   let transitions = Array.sub transitions_tbl.data 0 n in
   { num_states = n; accepts; reaches; transitions }
+;;
+
+let of_tokens (token_regexes : (int * Regex.t) list) : t =
+  build token_regexes ~max_states:max_int
+;;
+
+let of_tokens_within ~max_states token_regexes =
+  match build token_regexes ~max_states with
+  | dfa -> Some dfa
+  | exception Over_budget -> None
 ;;
 
 (* -- minimisation -------------------------------------------------------------

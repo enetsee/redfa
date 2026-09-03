@@ -1395,6 +1395,115 @@ let () =
   check "and they are different terms" (not (same_form (cycle 63) (cycle 64)))
 ;;
 
+(* -- state budgets --------------------------------------------------------- *)
+
+(* The unbounded forms are the bounded ones at [max_int], so agreeing
+   with a generous bound is the whole of what makes that safe. The
+   tight bounds check the other half, that the budget stops the
+   traversal rather than being ignored. *)
+let () =
+  let a = singleton_char 'a'
+  and b = singleton_char 'b' in
+  let dots k = List.init k (fun _ -> any) in
+  let toks = [ 0, seqs (star any :: a :: dots 6) ] in
+  let d = Dfa.of_tokens toks in
+  let n = Dfa.num_states d in
+  check "the budget test has an automaton to bound" (n = 128);
+  check
+    "of_tokens_within with room agrees with of_tokens"
+    (match Dfa.of_tokens_within ~max_states:(n + 10) toks with
+     | Some d' -> same_dfa d d'
+     | None -> false);
+  check
+    "of_tokens_within at exactly the state count succeeds"
+    (match Dfa.of_tokens_within ~max_states:n toks with
+     | Some d' -> same_dfa d d'
+     | None -> false);
+  check
+    "of_tokens_within one state short gives None"
+    (Dfa.of_tokens_within ~max_states:(n - 1) toks = None);
+  List.iter
+    (fun m ->
+       check
+         (Printf.sprintf "of_tokens_within at %d gives None" m)
+         (Dfa.of_tokens_within ~max_states:m toks = None))
+    [ 1; 0; -1 ];
+  (* The case the budget exists for. [.*a.{16}] is 131072 states and
+     [.*a.{20}] two million, so if the bound were ignored this check
+     would take the suite from a second to minutes rather than
+     failing. *)
+  check
+    "a 131072 state automaton is refused at 1000"
+    (Dfa.of_tokens_within ~max_states:1000 [ 0, seqs (star any :: a :: dots 16) ] = None);
+  check
+    "a two million state automaton is refused at 1000"
+    (Dfa.of_tokens_within ~max_states:1000 [ 0, seqs (star any :: a :: dots 20) ] = None);
+  (* The two decisions, the same way round. [.*a.{6}] is 128 states,
+     which both traverse in a millisecond or two; the automata above
+     are for the construction bound, where the budget makes the size
+     free. *)
+  let mid = seqs (star any :: a :: dots 6) in
+  check
+    "equivalent_within with room agrees with equivalent"
+    (equivalent_within ~max_states:100_000 mid (inter mid (star any)) = Some true);
+  check
+    "equivalent_within under a tight bound gives None"
+    (equivalent_within ~max_states:10 mid (inter mid (star any)) = None);
+  check
+    "is_empty_language_within with room agrees"
+    (is_empty_language_within ~max_states:100_000 (inter mid (complement mid)) = Some true);
+  check
+    "is_empty_language_within under a tight bound gives None"
+    (is_empty_language_within ~max_states:10 (inter mid (complement mid)) = None);
+  (* A bound of zero still answers where nothing has to be traversed,
+     the nullable test coming before the budget. *)
+  check
+    "a nullable disagreement answers at a bound of zero"
+    (equivalent_within ~max_states:0 eps a = Some false);
+  check
+    "a nullable root answers at a bound of zero"
+    (is_empty_language_within ~max_states:0 eps = Some false);
+  check
+    "an empty term answers at a bound of zero"
+    (is_empty_language_within ~max_states:0 empty = Some true);
+  check "and a pair needing a step does not" (equivalent_within ~max_states:0 a b = None)
+;;
+
+(* Over random terms: a generous bound always reproduces the unbounded
+   answer, and some bound in between is [None] on both, so the budget
+   is doing something at both ends. *)
+let () =
+  let st = Random.State.make [| 2718281 |] in
+  let bounded_agrees = ref 0
+  and tight_refused = ref 0 in
+  for _ = 1 to 400 do
+    let r, _ = gen ~alphabet st 3 in
+    let s, _ = gen ~alphabet st 3 in
+    let ar = to_ast r
+    and as_ = to_ast s in
+    check
+      "equivalent_within at max_int is equivalent"
+      (Ast.equivalent_within ~max_states:max_int ar as_ = Some (Ast.equivalent ar as_));
+    check
+      "is_empty_language_within at max_int is is_empty_language"
+      (Ast.is_empty_language_within ~max_states:max_int ar
+       = Some (Ast.is_empty_language ar));
+    incr bounded_agrees;
+    (* One state of budget is not enough for most pairs, and never
+       gives a wrong answer when it is. *)
+    match Ast.equivalent_within ~max_states:1 ar as_ with
+    | None -> incr tight_refused
+    | Some answer ->
+      check "a bounded answer is never wrong" (answer = Ast.equivalent ar as_)
+  done;
+  check
+    (Printf.sprintf
+       "the budget refuses some pairs at one state (%d of %d)"
+       !tight_refused
+       !bounded_agrees)
+    (!tight_refused > 0 && !tight_refused < !bounded_agrees)
+;;
+
 (* -- the intern table gives memory back ------------------------------------ *)
 
 (* Entries are weak, so transient terms are collected on their own. What

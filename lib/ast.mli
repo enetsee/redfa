@@ -42,4 +42,6 @@ val approx_representatives : t -> int list
 val approx_charset : t -> Ucharset.t list
 val is_empty_language : t -> bool
 val equivalent : t -> t -> bool
+val is_empty_language_within : max_states:int -> t -> bool option
+val equivalent_within : max_states:int -> t -> t -> bool option
 val pp : Format.formatter -> t -> unit

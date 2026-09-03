@@ -737,20 +737,32 @@ let approx_charset (r : t) : Ucharset.t list =
    what building the DFA costs.
    -------------------------------------------------------------------------- *)
 
+(* Raised past the budget and caught in the [_within] forms, so the
+   unbounded ones need no failure case. Nothing does arithmetic on
+   [limit] or on [max_states]: the unbounded forms pass [max_int], and
+   [max_int + 1] is negative. *)
+exception Budget_spent
+
 (* Reachable derivatives, until one is nullable: it accepts the empty
    string, so the input that reached it matches. [empty] derives to
-   itself and accepts nothing, so it is pruned. *)
-let is_empty_language (r : t) =
+   itself and accepts nothing, so it is pruned.
+
+   [limit] caps the derivatives visited, and is [max_int] for the
+   unbounded form, which spends one integer compare per state on
+   it. *)
+let is_empty_language_bounded (r : t) ~limit =
   if is_empty r
   then true
   else (
     let seen : (int, unit) Hashtbl.t = Hashtbl.create 64 in
     Hashtbl.add seen r.tag ();
-    let rec go = function
+    let rec go k = function
       | [] -> true
       | x :: rest ->
         if x.nullable
         then false
+        else if k >= limit
+        then raise Budget_spent
         else (
           let p = approx_partition x in
           let todo = ref rest in
@@ -761,9 +773,17 @@ let is_empty_language (r : t) =
               Hashtbl.add seen d.tag ();
               todo := d :: !todo)
           done;
-          go !todo)
+          go (k + 1) !todo)
     in
-    go [ r ])
+    go 0 [ r ])
+;;
+
+let is_empty_language (r : t) = is_empty_language_bounded r ~limit:max_int
+
+let is_empty_language_within ~max_states r =
+  match is_empty_language_bounded r ~limit:max_states with
+  | answer -> Some answer
+  | exception Budget_spent -> None
 ;;
 
 (* Union-find over node tags, for [equivalent]. A tag absent from
@@ -816,20 +836,24 @@ let uf_union uf a b =
    Hopcroft & Karp, "A Linear Algorithm for Testing Equivalence of
    Finite Automata", 1971; the relation it accumulates is a
    bisimulation up to equivalence (Bonchi & Pous, POPL 2013). *)
-let equivalent (a : t) (b : t) =
+let equivalent_bounded (a : t) (b : t) ~limit =
   if equal a b
   then true
   else (
     let uf = uf_create 64 in
-    let rec go = function
+    (* The budget is tested after [nullable], so a pair that settles
+       the question is not thrown away for being one over it. *)
+    let rec go k = function
       | [] -> true
       | (x, y) :: rest ->
         let rx = uf_find uf x.tag
         and ry = uf_find uf y.tag in
         if rx = ry
-        then go rest
+        then go k rest
         else if x.nullable <> y.nullable
         then false
+        else if k >= limit
+        then raise Budget_spent
         else (
           uf_union uf rx ry;
           let p = Ucharset.Partition.meet (approx_partition x) (approx_partition y) in
@@ -842,9 +866,17 @@ let equivalent (a : t) (b : t) =
                nothing. Skipping it saves two [find]s. *)
             if not (equal dx dy) then todo := (dx, dy) :: !todo
           done;
-          go !todo)
+          go (k + 1) !todo)
     in
-    go [ a, b ])
+    go 0 [ a, b ])
+;;
+
+let equivalent (a : t) (b : t) = equivalent_bounded a b ~limit:max_int
+
+let equivalent_within ~max_states a b =
+  match equivalent_bounded a b ~limit:max_states with
+  | answer -> Some answer
+  | exception Budget_spent -> None
 ;;
 
 (* -- pretty-printing ------------------------------------------------------- *)

@@ -946,6 +946,14 @@ let to_oniguruma c =
 let is_empty_language t = Ast.is_empty_language (to_ast t)
 let equivalent a b = Ast.equivalent (to_ast a) (to_ast b)
 
+let is_empty_language_within ~max_states t =
+  Ast.is_empty_language_within ~max_states (to_ast t)
+;;
+
+let equivalent_within ~max_states a b =
+  Ast.equivalent_within ~max_states (to_ast a) (to_ast b)
+;;
+
 (* -- pretty-printing ------------------------------------------------------- *)
 
 (* [src] writes [Neg_chars] as the atomic class source [[^...]], so
