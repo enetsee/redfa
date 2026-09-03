@@ -37,6 +37,14 @@ module Ast : sig
 
   type t
 
+  (* [tag] is the node's identity in the intern table, handed out in
+     allocation order, and [compare] and [hash] are built from it. So
+     the order is the order the nodes were first interned in, says
+     nothing about their structure, and does not survive a run: a node
+     collected and interned again ranks differently against nodes
+     interned before it. Fit for a [Map] or [Set] key within a run,
+     not for one to store or sort by. [equal] is pointer equality. *)
+
   val tag : t -> int
   val equal : t -> t -> bool
   val compare : t -> t -> int
@@ -74,6 +82,8 @@ module Ast : sig
   val is_eps : t -> bool
   val is_chars : t -> bool
   val is_nullable : t -> bool
+
+  (* [eps] is the canonical [Seq] of nothing, so [is_seq eps] holds. *)
   val is_seq : t -> bool
   val is_alt : t -> bool
 
@@ -83,6 +93,9 @@ module Ast : sig
 
   (* -- smart constructors -------------------------------------------------- *)
 
+  (* {!singleton} and {!range} validate their codepoints through
+     Ucharset, so a surrogate or a value outside [0 .. 0x10FFFF]
+     raises [Invalid_argument]. *)
   val chars : Ucharset.t -> t
   val singleton : int -> t
   val range : lo:int -> hi:int -> t
@@ -104,7 +117,9 @@ module Ast : sig
   val plus : t -> t
   val opt : t -> t
 
-  (* Children of a [Seq] or an [Alt], or the node in a singleton list. *)
+  (* Children of a [Seq] or an [Alt], or the node in a singleton list.
+     [seq_children eps] is the empty list, [eps] being the [Seq] of
+     nothing, not a list holding [eps]. *)
   val seq_children : t -> t list
   val alt_children : t -> t list
 
@@ -190,6 +205,11 @@ module Regex : sig
 
      Smart constructors, taking the local algebraic simplifications and
      leaving the rest as written.
+
+     Every one taking a raw [int] codepoint validates it through
+     Ucharset, so a surrogate or a value outside [0 .. 0x10FFFF]
+     raises [Invalid_argument]. The [_char] and [_uchar] forms take
+     scalar values already and cannot raise.
      ------------------------------------------------------------------------ *)
 
   val chars : Ucharset.t -> t
@@ -376,8 +396,14 @@ module Dfa : sig
      order: the tokens this state accepts. *)
   val accepts : t -> state_id -> int list
 
-  (* Case ids still present in this state's item set: the tokens still
-     reachable from here. A superset of {!accepts}. *)
+  (* Case ids still present in this state's item set. A superset of
+     {!accepts}, and an over-approximation of what can still match: an
+     item is dropped only when its regex derives to [empty], and a
+     regex can denote the empty language without the normal form
+     saying so. {!minimise} does not tighten it, and the states
+     concerned need not be dead -- the tokens "a(b.*&c.*)" and "a"
+     give an automaton whose every state lists both, before and after,
+     though only the second can ever match. *)
   val reaches : t -> state_id -> int list
 
   (* Outgoing transitions. Each [(charset, dest)] means any codepoint in

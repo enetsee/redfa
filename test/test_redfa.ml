@@ -147,6 +147,65 @@ let check name cond =
     Printf.printf "FAIL: %s\n" name)
 ;;
 
+(* -- what [Ast]'s exported identity means ---------------------------------- *)
+
+(* [tag] is handed out in allocation order and [compare] and [hash] are
+   built from it, so rank is interning order and says nothing about
+   structure. First in the file, so these codepoints are certainly
+   being interned here for the first time. *)
+let () =
+  let first = Ast.singleton 0x2F800 in
+  let second = Ast.singleton 0x2F801 in
+  let third = Ast.singleton 0x2F7FF in
+  check "tags ascend with interning order" (Ast.tag first < Ast.tag second);
+  check "compare follows the tags" (Ast.compare first second < 0);
+  check "hash is the tag" (Ast.hash first = Ast.tag first);
+  (* [third] holds the smallest codepoint and was interned last, so a
+     structural order would rank it first. It does not. *)
+  check
+    "compare is not structural"
+    (Ast.compare third first > 0 && Ast.compare third second > 0);
+  check
+    "compare is zero exactly on equal nodes"
+    (Ast.compare first first = 0 && Ast.equal first first && Ast.compare first second <> 0);
+  (* [eps] is the canonical [Seq] of nothing, so both of these are
+     traps for a caller matching on shape. *)
+  check "is_seq holds of eps" (Ast.is_seq Ast.eps);
+  check "seq_children of eps is the empty list" (Ast.seq_children Ast.eps = []);
+  check "is_alt does not hold of eps" (not (Ast.is_alt Ast.eps));
+  (* Every constructor taking a raw codepoint validates it through
+     Ucharset, which the .mli now says. *)
+  let raises f =
+    match f 0xD800 with
+    | () -> false
+    | exception Invalid_argument _ -> true
+  and raises_high f =
+    match f 0x110000 with
+    | () -> false
+    | exception Invalid_argument _ -> true
+  in
+  List.iter
+    (fun (name, f) ->
+       check (name ^ " raises on a surrogate") (raises f);
+       check (name ^ " raises above U+10FFFF") (raises_high f))
+    [ ("Ast.singleton", fun cp -> ignore (Ast.singleton cp))
+    ; ("Ast.range", fun cp -> ignore (Ast.range ~lo:cp ~hi:cp))
+    ; ("singleton", fun cp -> ignore (singleton cp))
+    ; ("range", fun cp -> ignore (range ~lo:cp ~hi:cp))
+    ; ("not_singleton", fun cp -> ignore (not_singleton cp))
+    ; ("not_range", fun cp -> ignore (not_range ~lo:cp ~hi:cp))
+    ; ("chars_of_list", fun cp -> ignore (chars_of_list [ cp ]))
+    ; ("chars_in_ranges", fun cp -> ignore (chars_in_ranges [ cp, cp ]))
+    ; ("one_of ~singles", fun cp -> ignore (one_of ~singles:[ cp ] ()))
+    ; ("one_of ~ranges", fun cp -> ignore (one_of ~ranges:[ cp, cp ] ()))
+    ];
+  (* The [_char] and [_uchar] forms take scalar values already. *)
+  check "singleton_char cannot raise" (not (is_empty (singleton_char 'a')));
+  check
+    "singleton_uchar cannot raise"
+    (not (is_empty (singleton_uchar (Uchar.of_int 0x3BB))))
+;;
+
 (* -- the language the engine computes -------------------------------------- *)
 
 let () =
@@ -896,9 +955,38 @@ let correspondence (d : Dfa.t) (m : Dfa.t) =
 
 (* -- the properties -------------------------------------------------------- *)
 
+(* Case ids some reachable state accepts: what [reaches] would name if
+   it were exact. A fixpoint over the transition graph, which shares
+   nothing with the item-set projection [reaches] comes from. *)
+let matchable (d : Dfa.t) =
+  let n = Dfa.num_states d in
+  let out = Array.make n [] in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    for id = n - 1 downto 0 do
+      let acc =
+        List.sort_uniq
+          Int.compare
+          (List.fold_left
+             (fun a (_, dst) -> out.(dst) @ a)
+             (Dfa.accepts d id)
+             (Dfa.transitions d id))
+      in
+      if acc <> out.(id)
+      then (
+        out.(id) <- acc;
+        changed := true)
+    done
+  done;
+  out
+;;
+
 let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
   let st = Random.State.make [| seed |] in
   let corp = cp_corpus ~alphabet ~len in
+  let over_built = ref 0
+  and over_min = ref 0 in
   for _ = 1 to trials do
     let tokens =
       List.init
@@ -973,6 +1061,20 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
         let mins = List.filter_map Ucharset.min_elt_opt css in
         check (name (what ^ " labels ascending")) (mins = List.sort Int.compare mins))
     in
+    (* [reaches] is documented as an over-approximation of what can
+       still match, and as one that survives [minimise]. Both halves
+       are pinned: never short of what is matchable, and sometimes
+       longer, on each automaton. *)
+    List.iter
+      (fun (what, a, counter) ->
+         let m = matchable a in
+         Dfa.iter_states a (fun id ->
+           let r = Dfa.reaches a id in
+           check
+             (name (what ^ " reaches covers what can still match"))
+             (List.for_all (fun c -> List.mem c r) m.(id));
+           if r <> m.(id) then incr counter))
+      [ "built", dfa, over_built; "minimised", mini, over_min ];
     well_formed "built" dfa;
     well_formed "minimised" mini;
     (* [reaches] at a merged state is the union of those merged: the
@@ -1004,7 +1106,14 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
         check
           (name "reaches at a merged state is the union of those merged")
           (Dfa.reaches mini id = List.sort_uniq Int.compare merged.(id))))
-  done
+  done;
+  check
+    (Printf.sprintf
+       "%s: reaches over-approximates, before and after minimise (%d, %d states)"
+       label
+       !over_built
+       !over_min)
+    (!over_built > 0 && !over_min > 0)
 ;;
 
 let () =

@@ -105,11 +105,11 @@ let iter_states t f =
 (* -- construction ---------------------------------------------------------- *)
 
 (* Joint approx partition for a state's items, the common refinement
-   of each item's own. Stays in [Ucharset.Partition.t], so the loop
-   below takes a representative per block and builds a [Ucharset.t]
-   only for blocks carrying a live transition. An [empty] item
-   contributes the single block covering the codespace, neutral under
-   meet. *)
+   of each item's own. Stays in [Ucharset.Partition.t], so a chain of
+   meets never materialises an intermediate block. The loop below does
+   build every block of the result, in one [Partition.blocks] call,
+   the transitions needing them as labels. An [empty] item contributes
+   the single block covering the codespace, neutral under meet. *)
 let approx_partition items =
   Ucharset.Partition.meet_all (List.map (fun it -> Ast.approx_partition it.regex) items)
 ;;
