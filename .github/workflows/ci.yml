@@ -23,8 +23,11 @@ jobs:
         with:
           ocaml-compiler: ${{ matrix.ocaml-compiler }}
 
-      # ucharset is not on opam yet. Drop this once it is published.
-      - run: opam pin add ucharset https://github.com/enetsee/ucharset.git --no-action
+      # ucharset is not on opam yet, and a git pin resolves to version
+      # "dev", which no lower bound accepts. Naming the version makes the
+      # constraint in dune-project satisfiable. Drop both once it is
+      # published.
+      - run: opam pin add ucharset.0.2.0 https://github.com/enetsee/ucharset.git --no-action
 
       - run: opam install . --deps-only --with-test
 
@@ -41,6 +44,12 @@ jobs:
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.4"
+
+      # ucharset is not on opam yet, and a git pin resolves to version
+      # "dev", which no lower bound accepts. Naming the version makes the
+      # constraint in dune-project satisfiable. Drop both once it is
+      # published.
+      - run: opam pin add ucharset.0.2.0 https://github.com/enetsee/ucharset.git --no-action
 
       # pinned in .ocamlformat, so this checks the exact version the repo uses
       - uses: ocaml/setup-ocaml/lint-fmt@v3
