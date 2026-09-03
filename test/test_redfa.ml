@@ -266,6 +266,145 @@ let () =
   check "one_of with nothing is the empty language" (is_empty (one_of ()))
 ;;
 
+(* -- escapes --------------------------------------------------------------- *)
+
+(* Whether a string is well formed UTF-8. An error message goes to a
+   log or a terminal, so one carrying a raw byte out of the source is
+   a defect in its own right. *)
+let is_utf8 s =
+  let ok = ref true
+  and i = ref 0 in
+  while !i < String.length s do
+    let d = String.get_utf_8_uchar s !i in
+    if not (Uchar.utf_decode_is_valid d) then ok := false;
+    i := !i + Uchar.utf_decode_length d
+  done;
+  !ok
+;;
+
+let () =
+  let rejects src =
+    check
+      (Printf.sprintf "of_string should reject %S" src)
+      (match of_string src with
+       | Ok _ -> false
+       | Error _ -> true)
+  in
+  let parses_as src t =
+    check (Printf.sprintf "of_string %S" src) (of_string src = Ok t)
+  in
+  let errors_with src msg =
+    check
+      (Printf.sprintf "of_string %S reports %S" src msg)
+      (match of_string src with
+       | Error e -> e.msg = msg
+       | Ok _ -> false)
+  in
+  (* [int_of_string] reads [_] as a digit separator, so [\u{6_1}] and
+     [\u{61_}] both parsed as [a]. *)
+  rejects "\\u{6_1}";
+  rejects "\\u{61_}";
+  rejects "\\u{_61}";
+  rejects "\\u{6 1}";
+  rejects "\\u{6+1}";
+  rejects "\\u{0x61}";
+  (* Hex digits still parse, either case, leading zeros or not. *)
+  parses_as "\\u{61}" (singleton 0x61);
+  parses_as "\\u{0061}" (singleton 0x61);
+  parses_as "\\u{3bb}" (singleton 0x3BB);
+  parses_as "\\u{3BB}" (singleton 0x3BB);
+  parses_as "\\u{10FFFF}" (singleton 0x10FFFF);
+  (* Out of range, including a run too long for an int. The fold stops
+     climbing rather than overflowing, so the message names the value
+     rather than blaming the digits. *)
+  errors_with "\\u{110000}" "\\u{110000} is not a Unicode scalar value";
+  errors_with "\\u{D800}" "\\u{D800} is not a Unicode scalar value";
+  errors_with
+    "\\u{FFFFFFFFFFFFFFFF}"
+    "\\u{FFFFFFFFFFFFFFFF} is not a Unicode scalar value";
+  (* An unknown escape interpolated the byte after the backslash with
+     [%c], so a multi-byte character gave a message that was not
+     valid UTF-8. *)
+  errors_with "\\\u{E9}" "unknown escape \\\u{E9}";
+  errors_with "\\\u{3BB}" "unknown escape \\\u{3BB}";
+  errors_with "\\\u{10400}" "unknown escape \\\u{10400}";
+  errors_with "\\q" "unknown escape \\q";
+  (* A byte that is not UTF-8 at all is refused as such, and the caret
+     lands on the byte rather than on the backslash. *)
+  errors_with "\\\xff" "malformed UTF-8";
+  check
+    "the caret lands on the malformed byte"
+    (match of_string "\\\xff" with
+     | Error e -> e.pos = 1
+     | Ok _ -> false);
+  (* The property behind those two: no message carries a raw byte out
+     of the source. Run over every character the round-trip alphabet
+     covers, which is where the multi-byte ones are. *)
+  let bad = ref 0 in
+  Array.iter
+    (fun cp ->
+       let b = Buffer.create 8 in
+       Buffer.add_char b '\\';
+       Buffer.add_utf_8_uchar b (Uchar.of_int cp);
+       match of_string (Buffer.contents b) with
+       | Ok _ -> ()
+       | Error e -> if not (is_utf8 e.msg) then incr bad)
+    meta_alphabet;
+  check "every escape error message is valid UTF-8" (!bad = 0);
+  (* Every ASCII byte, either side of the rule the .mli states: a
+     backslash before a printable non-alphanumeric is that character,
+     and a backslash before space, a C0 control or DEL is an error.
+     The letters and digits are left out, being the named escapes and
+     the errors the block above covers. *)
+  let escaped cp =
+    let b = Buffer.create 4 in
+    Buffer.add_char b '\\';
+    Buffer.add_char b (Char.chr cp);
+    Buffer.contents b
+  in
+  let is_alnum cp =
+    (cp >= Char.code '0' && cp <= Char.code '9')
+    || (cp >= Char.code 'a' && cp <= Char.code 'z')
+    || (cp >= Char.code 'A' && cp <= Char.code 'Z')
+  in
+  let punct = ref 0
+  and refused = ref 0 in
+  for cp = 0x21 to 0x7E do
+    if not (is_alnum cp)
+    then (
+      incr punct;
+      check
+        (Printf.sprintf "escaped U+%04X is that character" cp)
+        (of_string (escaped cp) = Ok (singleton cp)))
+  done;
+  List.iter
+    (fun cp ->
+       incr refused;
+       check
+         (Printf.sprintf "escaped U+%04X is refused" cp)
+         (match of_string (escaped cp) with
+          | Error e -> e.msg = Printf.sprintf "unknown escape: U+%04X" cp
+          | Ok _ -> false))
+    (List.init 0x21 (fun cp -> cp) @ [ 0x7F ]);
+  check
+    (Printf.sprintf
+       "the ASCII sweep covers both sides (%d escapable, %d refused)"
+       !punct
+       !refused)
+    (!punct = 32 && !refused = 34);
+  (* And no message carries a control character either, which is the
+     same defect as the raw byte above wearing different clothes. *)
+  let ctrl = ref 0 in
+  for cp = 0x00 to 0x7F do
+    match of_string (escaped cp) with
+    | Ok _ -> ()
+    | Error e ->
+      if String.exists (fun ch -> Char.code ch < 0x20 || Char.code ch = 0x7F) e.msg
+      then incr ctrl
+  done;
+  check "no escape error message carries a control character" (!ctrl = 0)
+;;
+
 (* -- source round trips ---------------------------------------------------- *)
 
 (* Equality of the lowered terms, which is what [Regex.equivalent]

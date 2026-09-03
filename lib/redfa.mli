@@ -272,7 +272,10 @@ module Regex : sig
 
      Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the shorthand
      classes [\d], [\w], [\s] with their negations, and a backslash
-     before ASCII punctuation for that character literally.
+     before any printable ASCII character that is not a letter or a
+     digit, for that character literally. Space, the C0 controls and
+     DEL are not metacharacters, so a backslash before one is an
+     error rather than that character.
      ------------------------------------------------------------------------ *)
 
   type error =

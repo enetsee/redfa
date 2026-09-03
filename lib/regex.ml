@@ -387,7 +387,19 @@ let word_set =
 
 let space_set = Ucharset.of_utf_8_string " \t\n\r\012"
 
-(* [\u{HHHH}], the braces required so the digit run has an end. *)
+let hex_value = function
+  | '0' .. '9' as ch -> Some (Char.code ch - Char.code '0')
+  | 'a' .. 'f' as ch -> Some (Char.code ch - Char.code 'a' + 10)
+  | 'A' .. 'F' as ch -> Some (Char.code ch - Char.code 'A' + 10)
+  | _ -> None
+;;
+
+(* [\u{HHHH}], the braces required so the digit run has an end.
+
+   The digits are folded here rather than passed to [int_of_string],
+   which takes [_] as a separator: [\u{6_1}] parsed as [a]. The fold
+   stops climbing once past [max_codepoint], so a long run overflows
+   nothing and still fails the range test below. *)
 let parse_unicode_escape c =
   let start = c.at - 2 in
   expect c '{' "after \\u";
@@ -399,12 +411,30 @@ let parse_unicode_escape c =
   let digits = String.sub c.src from (c.at - from) in
   ignore (bump c);
   if digits = "" then fail_at start "empty \\u escape";
-  match int_of_string_opt ("0x" ^ digits) with
-  | None -> fail_at start (Printf.sprintf "invalid hex in \\u escape: %S" digits)
-  | Some cp ->
-    if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)
-    then fail_at start (Printf.sprintf "\\u{%s} is not a Unicode scalar value" digits);
-    cp
+  let cp = ref 0
+  and hex = ref true in
+  String.iter
+    (fun ch ->
+       match hex_value ch with
+       | None -> hex := false
+       | Some v -> if !cp <= 0x10FFFF then cp := (!cp * 16) + v)
+    digits;
+  if not !hex then fail_at start (Printf.sprintf "invalid hex in \\u escape: %S" digits);
+  if !cp > 0x10FFFF || (!cp >= 0xD800 && !cp <= 0xDFFF)
+  then fail_at start (Printf.sprintf "\\u{%s} is not a Unicode scalar value" digits);
+  !cp
+;;
+
+(* Printable ASCII that is not a letter or a digit: the characters the
+   grammar reserves, and the rest of the ASCII punctuation with them.
+   [src] writes space as itself and a control as [\t] or [\u{HH}], so
+   nothing here ever emits a backslash before one. *)
+let is_ascii_punct ch =
+  let c = Char.code ch in
+  c > 0x20
+  && c < 0x7F
+  && (not (c >= Char.code '0' && c <= Char.code '9'))
+  && not ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))
 ;;
 
 (* Escapes yielding a single codepoint. A shorthand class returns
@@ -421,12 +451,23 @@ let parse_escape_cp c =
   | '0' -> Some 0x00
   | 'u' -> Some (parse_unicode_escape c)
   | 'd' | 'w' | 's' | 'D' | 'W' | 'S' -> None
-  | ch
-    when (not (Char.code ch >= 0x30 && Char.code ch <= 0x39))
-         && Char.code ch < 0x80
-         && not ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) ->
-    Some (Char.code ch)
-  | ch -> fail_at start (Printf.sprintf "unknown escape \\%c" ch)
+  | ch when is_ascii_punct ch -> Some (Char.code ch)
+  (* Space, the C0 controls and DEL are not metacharacters, so a
+     backslash before one escapes nothing and is a mistake. Named by
+     codepoint, since the character itself would go into the message
+     raw. *)
+  | ch when Char.code ch < 0x21 || Char.code ch = 0x7F ->
+    fail_at start (Printf.sprintf "unknown escape: U+%04X" (Char.code ch))
+  (* The byte after the backslash can be the lead of a multi-byte
+     character, so decode it. [%c] on the raw byte made an error
+     message that was not itself valid UTF-8. *)
+  | _ ->
+    let d = String.get_utf_8_uchar c.src (start + 1) in
+    if not (Uchar.utf_decode_is_valid d) then fail_at (start + 1) "malformed UTF-8";
+    let b = Buffer.create 16 in
+    Buffer.add_string b "unknown escape \\";
+    Buffer.add_utf_8_uchar b (Uchar.utf_decode_uchar d);
+    fail_at start (Buffer.contents b)
 ;;
 
 let shorthand_set = function
