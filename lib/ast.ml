@@ -725,6 +725,128 @@ let approx_charset (r : t) : Ucharset.t list =
   Ucharset.Partition.blocks (approx_partition r)
 ;;
 
+(* -- deciding a language ------------------------------------------------------
+
+   Emptiness and equivalence of the language, not of the term:
+   [equal] separates [a*a*] from [a*], and [is_empty] misses [a & ~a].
+
+   A node and [deriv] are a deterministic automaton, so both traverse
+   one instead of building it. States are nodes, acceptance is
+   [nullable], the alphabet is [approx_partition]. Derivatives are
+   finite, so both terminate. Neither is bounded, and each costs about
+   what building the DFA costs.
+   -------------------------------------------------------------------------- *)
+
+(* Reachable derivatives, until one is nullable: it accepts the empty
+   string, so the input that reached it matches. [empty] derives to
+   itself and accepts nothing, so it is pruned. *)
+let is_empty_language (r : t) =
+  if is_empty r
+  then true
+  else (
+    let seen : (int, unit) Hashtbl.t = Hashtbl.create 64 in
+    Hashtbl.add seen r.tag ();
+    let rec go = function
+      | [] -> true
+      | x :: rest ->
+        if x.nullable
+        then false
+        else (
+          let p = approx_partition x in
+          let todo = ref rest in
+          for i = Ucharset.Partition.num_blocks p - 1 downto 0 do
+            let d = deriv x ~uchr:(Ucharset.Partition.representative p i) in
+            if (not (is_empty d)) && not (Hashtbl.mem seen d.tag)
+            then (
+              Hashtbl.add seen d.tag ();
+              todo := d :: !todo)
+          done;
+          go !todo)
+    in
+    go [ r ])
+;;
+
+(* Union-find over node tags, for [equivalent]. A tag absent from
+   [parent] is its own class, so only merges are stored. Union by
+   size, path compression in [find]. *)
+type uf =
+  { parent : (int, int) Hashtbl.t
+  ; size : (int, int) Hashtbl.t (* class size, at the root only *)
+  }
+
+let uf_create n = { parent = Hashtbl.create n; size = Hashtbl.create n }
+
+let rec uf_find uf x =
+  match Hashtbl.find_opt uf.parent x with
+  | None -> x
+  | Some p ->
+    let r = uf_find uf p in
+    if r <> p then Hashtbl.replace uf.parent x r;
+    r
+;;
+
+let uf_size uf x =
+  match Hashtbl.find_opt uf.size x with
+  | Some s -> s
+  | None -> 1
+;;
+
+(* [a] and [b] are roots of distinct classes. *)
+let uf_union uf a b =
+  let sa = uf_size uf a
+  and sb = uf_size uf b in
+  let big, small = if sa >= sb then a, b else b, a in
+  Hashtbl.replace uf.parent small big;
+  Hashtbl.replace uf.size big (sa + sb)
+;;
+
+(* Assume the two match the same strings, then look for one that tells
+   them apart. Pairs come off a stack. Sides that disagree on
+   [nullable] mean no. A pair already in one class was assumed equal,
+   so skip it. Otherwise merge, and push the derivatives, one per
+   block of the two partitions met together.
+
+   Skipping merged pairs is what beats the reachable product: one
+   expansion per node at most, against one per pair of nodes. On
+   automata both far from minimal that is [p + q] against [p * q].
+   [(a{63})*a*] against [(a{64})*a*], both [a*], is 127 pairs and 0.13
+   ms here against 4958 and 3.5 ms; level on the four token sets in
+   [bench], where the automata run in lockstep.
+
+   Hopcroft & Karp, "A Linear Algorithm for Testing Equivalence of
+   Finite Automata", 1971; the relation it accumulates is a
+   bisimulation up to equivalence (Bonchi & Pous, POPL 2013). *)
+let equivalent (a : t) (b : t) =
+  if equal a b
+  then true
+  else (
+    let uf = uf_create 64 in
+    let rec go = function
+      | [] -> true
+      | (x, y) :: rest ->
+        let rx = uf_find uf x.tag
+        and ry = uf_find uf y.tag in
+        if rx = ry
+        then go rest
+        else if x.nullable <> y.nullable
+        then false
+        else (
+          uf_union uf rx ry;
+          let p = Ucharset.Partition.meet (approx_partition x) (approx_partition y) in
+          let todo = ref rest in
+          for i = Ucharset.Partition.num_blocks p - 1 downto 0 do
+            let c = Ucharset.Partition.representative p i in
+            let dx = deriv x ~uchr:c
+            and dy = deriv y ~uchr:c in
+            (* One node is one class already, so the pair tells us
+               nothing. Skipping it saves two [find]s. *)
+            if not (equal dx dy) then todo := (dx, dy) :: !todo
+          done;
+          go !todo)
+    in
+    go [ a, b ])
+;;
+
 (* -- pretty-printing ------------------------------------------------------- *)
 
 let prec_of (t : t) =

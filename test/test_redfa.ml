@@ -268,6 +268,12 @@ let () =
 
 (* -- source round trips ---------------------------------------------------- *)
 
+(* Equality of the lowered terms, which is what [Regex.equivalent]
+   used to be. The round trips below use it rather than [equivalent],
+   which now decides the language and would pass a printer that
+   rendered [a*] as ["a*a*"]. *)
+let same_form a b = Ast.equal (to_ast a) (to_ast b)
+
 let round_trips ~alphabet ~seed ~n =
   let st = Random.State.make [| seed |] in
   for _ = 1 to n do
@@ -280,7 +286,7 @@ let round_trips ~alphabet ~seed ~n =
        check
          (Printf.sprintf "to_string produced unparseable source %S: %s" src e.msg)
          false
-     | Ok back -> check (Printf.sprintf "round trip %S" src) (equivalent r back));
+     | Ok back -> check (Printf.sprintf "round trip %S" src) (same_form r back));
     (* Oniguruma output is a subset of the same syntax, once [(?:] is
        read as a group. *)
     match to_oniguruma r with
@@ -289,7 +295,7 @@ let round_trips ~alphabet ~seed ~n =
       (match of_string oni with
        | Error e -> check (Printf.sprintf "oniguruma %S unparseable: %s" oni e.msg) false
        | Ok back ->
-         check (Printf.sprintf "oniguruma round trip %S" oni) (equivalent r back))
+         check (Printf.sprintf "oniguruma round trip %S" oni) (same_form r back))
   done
 ;;
 
@@ -319,7 +325,7 @@ let () =
           | Ok back ->
             check
               (Printf.sprintf "literal U+%04X survives oniguruma as %S" cp oni)
-              (equivalent r back)))
+              (same_form r back)))
     meta_alphabet;
   (* The exact reproductions from the review. *)
   List.iter
@@ -336,7 +342,7 @@ let () =
              | Ok back ->
                check
                  (Printf.sprintf "%S -> oniguruma %S round trips" src oni)
-                 (equivalent r back))))
+                 (same_form r back))))
     [ "\\&"; "a\\&b"; "\\~"; "\\~*"; "a\\&b|\\~" ]
 ;;
 
@@ -432,7 +438,7 @@ let () =
     | Error e ->
       check (Printf.sprintf "%s: to_string gave unparseable %S: %s" name src e.msg) false
     | Ok back ->
-      check (Printf.sprintf "%s reads back from %S" name src) (equivalent t back)
+      check (Printf.sprintf "%s reads back from %S" name src) (same_form t back)
   in
   List.iter
     (fun (name, t) -> reads_back name t)
@@ -447,7 +453,7 @@ let () =
     ; "Inter [Inter []; a]", Inter [ Inter []; a ]
     ; "Alt [Alt []; a]", Alt [ Alt []; a ]
     ];
-  (* [equivalent] would be satisfied by any two terms that agree, so
+  (* [same_form] would be satisfied by any two terms that agree, so
      pin the languages the two empty lists denote as well. *)
   check "Alt [] is the empty language" (not (Ast.eval (to_ast (Alt [])) ""));
   check "Alt [] matches nothing at all" (not (Ast.eval (to_ast (Alt [])) "a"));
@@ -918,6 +924,227 @@ let () =
       (Dfa.of_tokens [ 0, inter (singleton_char 'a') (complement (singleton_char 'a')) ])
   in
   check "an empty language is one dead state" (Dfa.num_states e = 1 && Dfa.is_dead e 0)
+;;
+
+(* -- deciding a language --------------------------------------------------- *)
+
+(* The same decision, taken on the automaton. Both terms go in as
+   tokens of one DFA, whose states are the pairs of residuals reached
+   together, so a state accepting one and not the other is a
+   separating string. Shares [deriv] with [Ast.equivalent], as
+   everything here does, but nothing of how it decides. *)
+let dfa_equivalent r1 r2 =
+  let d = Dfa.of_tokens [ 0, r1; 1, r2 ] in
+  let agree = ref true in
+  Dfa.iter_states d (fun id ->
+    match Dfa.accepts d id with
+    | [ 0 ] | [ 1 ] -> agree := false
+    | _ -> ());
+  !agree
+;;
+
+(* Emptiness, likewise. [minimise] is documented to leave the empty
+   language as one dead state, and no dead state otherwise. *)
+let dfa_empty_language r =
+  let m = Dfa.minimise (Dfa.of_tokens [ 0, r ]) in
+  Dfa.num_states m = 1 && Dfa.is_dead m 0
+;;
+
+(* Rewritings that change the term and not the language. Each is an
+   identity over the boolean operations, which no amount of
+   flattening, sorting or dropping duplicates reaches: [Ast.equal]
+   cannot see [(r&x) | (r&~x)] as [r]. [x] is a second random term, so
+   the two sides have differently shaped automata. *)
+let rewrite st r x =
+  match Random.State.int st 5 with
+  (* r & (every string) *)
+  | 0 -> inter r (star any)
+  (* r | (r & ~r) *)
+  | 1 -> alt r (inter r (complement r))
+  (* r & (r | ~r) *)
+  | 2 -> inter r (alt r (complement r))
+  (* (r & x) | (r & ~x) *)
+  | 3 -> alt (inter r x) (inter r (complement x))
+  (* r | (r & x) *)
+  | _ -> alt r (inter r x)
+;;
+
+(* Random pairs, against the reference decision on the automaton and
+   against the corpus. [len] and [alphabet] fix the corpus; a corpus
+   disagreement is a witness string, so it settles the answer on its
+   own and is the check that shares no decision procedure at all with
+   the traversal. *)
+let check_equivalence ~label ~alphabet ~len ~seed ~trials ~depth =
+  let st = Random.State.make [| seed |] in
+  let corp = List.map utf8 (cp_corpus ~alphabet ~len) in
+  let name what = Printf.sprintf "%s: %s" label what in
+  (* Non-vacuity: how many rewritten pairs the normal form still sees
+     as different terms, and how many random pairs land either way. *)
+  let rewritten_distinct = ref 0
+  and random_same = ref 0
+  and random_differ = ref 0 in
+  for _ = 1 to trials do
+    let r, _ = gen ~alphabet st depth in
+    let x, _ = gen ~alphabet st depth in
+    let s, _ = gen ~alphabet st depth in
+    let ar = to_ast r
+    and as_ = to_ast s in
+    (* An identity the normal form cannot see. *)
+    let r' = rewrite st r x in
+    if not (same_form r r') then incr rewritten_distinct;
+    check (name "a rewriting that preserves the language is equivalent") (equivalent r r');
+    check (name "and the automaton agrees") (dfa_equivalent r r');
+    (* Two independent terms, against the automaton. *)
+    let got = equivalent r s in
+    if got then incr random_same else incr random_differ;
+    check (name "equivalent agrees with the automaton") (got = dfa_equivalent r s);
+    check (name "equivalent is symmetric") (got = equivalent s r);
+    check (name "equivalent is reflexive") (equivalent r r);
+    (* A witness in the corpus settles it without any automaton. *)
+    let witness = List.exists (fun w -> Ast.eval ar w <> Ast.eval as_ w) corp in
+    if witness then check (name "a witness string means not equivalent") (not got);
+    if got
+    then check (name "equivalent terms agree on every string of the corpus") (not witness);
+    (* Emptiness, the same three ways. *)
+    let empty_r = is_empty_language r in
+    check
+      (name "is_empty_language agrees with the automaton")
+      (empty_r = dfa_empty_language r);
+    check
+      (name "is_empty_language is equivalence to the empty language")
+      (empty_r = equivalent r empty);
+    if empty_r
+    then
+      check
+        (name "an empty language matches nothing in the corpus")
+        (not (List.exists (fun w -> Ast.eval ar w) corp));
+    if List.exists (fun w -> Ast.eval ar w) corp
+    then
+      check (name "a match in the corpus means the language is not empty") (not empty_r)
+  done;
+  check
+    (Printf.sprintf
+       "%s: the rewritings are not vacuous (%d/%d still distinct terms)"
+       label
+       !rewritten_distinct
+       trials)
+    (!rewritten_distinct > trials / 2);
+  check
+    (Printf.sprintf
+       "%s: random pairs land both ways (%d equivalent, %d not)"
+       label
+       !random_same
+       !random_differ)
+    (!random_same > 0 && !random_differ > 0)
+;;
+
+let () =
+  check_equivalence ~label:"equiv ascii" ~alphabet ~len:3 ~seed:5150 ~trials:600 ~depth:3;
+  check_equivalence
+    ~label:"equiv ascii deep"
+    ~alphabet
+    ~len:3
+    ~seed:60613
+    ~trials:200
+    ~depth:5;
+  (* Outside the BMP and across the surrogate boundaries, where the
+     two terms' partitions are refined together rather than shared. *)
+  check_equivalence
+    ~label:"equiv wide"
+    ~alphabet:wide_alphabet
+    ~len:2
+    ~seed:8128
+    ~trials:200
+    ~depth:3
+;;
+
+(* The review's own examples, and the two questions the type could not
+   answer before. Each names the structural test as well, so a
+   rewriting of [equivalent] back into [same_form] fails here rather
+   than passing quietly. *)
+let () =
+  let p src =
+    match of_string src with
+    | Ok r -> r
+    | Error e -> failwith (Printf.sprintf "%S: %s" src e.msg)
+  in
+  let equiv src1 src2 =
+    let a = p src1
+    and b = p src2 in
+    check
+      (Printf.sprintf "%S is equivalent to %S" src1 src2)
+      (equivalent a b && equivalent b a)
+  in
+  (* The same, where the normal form does not already see it, so the
+     check cannot pass by lowering the two to one node. *)
+  let equiv_beyond_aci src1 src2 =
+    equiv src1 src2;
+    check
+      (Printf.sprintf "%S and %S are different terms" src1 src2)
+      (not (same_form (p src1) (p src2)))
+  in
+  let differs src1 src2 =
+    let a = p src1
+    and b = p src2 in
+    check
+      (Printf.sprintf "%S is not equivalent to %S" src1 src2)
+      ((not (equivalent a b)) && not (equivalent b a))
+  in
+  (* The two the review names. *)
+  equiv_beyond_aci "a*a*" "a*";
+  equiv_beyond_aci "(ab)*a" "a(ba)*";
+  (* Identities over the boolean operations, which is what the
+     library is for. *)
+  equiv_beyond_aci "~(a|b)" "~a&~b";
+  equiv_beyond_aci "~(a&b)" "~a|~b";
+  equiv_beyond_aci "(a|b)*" "(a*b*)*";
+  equiv_beyond_aci "a&~a" "[^\\u{0}-\\u{10FFFF}]";
+  equiv_beyond_aci "\\u{3BB}*\\u{3BB}*" "\\u{3BB}*";
+  (* Two the normal form does see, kept because they are the shapes a
+     reader expects here: merging the classes of an [Alt] is exactly
+     what it is for. *)
+  equiv ".*" "(a|[^a])*";
+  equiv "a|b" "b|a";
+  (* Near misses, where a string of length one or two separates them. *)
+  differs "a*" "a+";
+  differs "a" "b";
+  differs "(ab)*a" "a(ab)*";
+  differs "~a" "~b";
+  differs "a|b" "a&b";
+  (* Emptiness the normal form does not see. *)
+  List.iter
+    (fun src ->
+       check (Printf.sprintf "%S is the empty language" src) (is_empty_language (p src));
+       check
+         (Printf.sprintf "%S is not the empty term" src)
+         (not (Ast.is_empty (to_ast (p src)))))
+    [ "a&~a"; "a.*&b.*"; "a*&~(a*)"; "~(.*)"; "ab&ba" ];
+  (* Emptiness the normal form does see, through the intersection of
+     two disjoint classes. Cheap, and the answer has to be the same. *)
+  List.iter
+    (fun src ->
+       check (Printf.sprintf "%S is the empty language" src) (is_empty_language (p src)))
+    [ "a&b"; "(a&b)c" ];
+  List.iter
+    (fun src ->
+       check
+         (Printf.sprintf "%S is not the empty language" src)
+         (not (is_empty_language (p src))))
+    [ "a"; ""; "~a"; "a*"; "a|b"; "~(a&~a)"; ".*" ];
+  (* Structurally empty, the one case that derives nothing. *)
+  check "the empty term is the empty language" (is_empty_language empty);
+  check "eps is not" (not (is_empty_language eps));
+  (* Two automata far from minimal, where the product is the size of
+     the two multiplied and the traversal is their sum. Both are [a*],
+     as a 63-state cycle and a 64-state one: 4958 pairs as a product,
+     127 with the union-find. If the union-find ever stops collapsing
+     them, this check takes far too long to finish. *)
+  let a = singleton_char 'a' in
+  let rep n = seqs (List.init n (fun _ -> a)) in
+  let cycle n = seq (star (rep n)) (star a) in
+  check "(a{64})*a* is a*" (equivalent (cycle 64) (star a));
+  check "(a{63})*a* is (a{64})*a*" (equivalent (cycle 63) (cycle 64));
+  check "and they are different terms" (not (same_form (cycle 63) (cycle 64)))
 ;;
 
 (* -- the intern table gives memory back ------------------------------------ *)

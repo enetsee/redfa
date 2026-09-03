@@ -1,5 +1,5 @@
 (executables
- (names deriv_bench scale_bench mem_bench part_bench dfa_bench)
+ (names deriv_bench scale_bench mem_bench part_bench dfa_bench equiv_bench)
  (ocamlopt_flags
   (:standard -O3))
  (libraries redfa ucharset unix))

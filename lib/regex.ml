@@ -897,10 +897,13 @@ let to_oniguruma c =
   | Emission_failed msg -> Error msg
 ;;
 
-(* Whether two regexes denote the same language up to the normal
-   form's associativity, commutativity and idempotence. Exact for
-   terms differing only by those, conservative otherwise. *)
-let equivalent a b = Ast.equal (to_ast a) (to_ast b)
+(* -- deciding a language --------------------------------------------------- *)
+
+(* Both lower and hand the question to {!Ast}, where the algorithm and
+   the cost are. The structural test [equivalent] used to be is still
+   [Ast.equal (to_ast a) (to_ast b)]. *)
+let is_empty_language t = Ast.is_empty_language (to_ast t)
+let equivalent a b = Ast.equivalent (to_ast a) (to_ast b)
 
 (* -- pretty-printing ------------------------------------------------------- *)
 

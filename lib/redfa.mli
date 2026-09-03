@@ -123,6 +123,27 @@ module Ast : sig
   val approx_representatives : t -> int list
   val approx_charset : t -> Ucharset.t list
 
+  (* -- deciding a language ----------------------------------------------------
+
+     Emptiness and equivalence of the language, not of the term:
+     {!equal} separates [a*a*] from [a*], and {!is_empty} misses
+     [a & ~a]. Both are exact, over the whole codespace and every
+     construct the type carries.
+
+     A node and {!deriv} are a deterministic automaton, so both
+     traverse one instead of building it: {!is_empty_language} looks
+     for a nullable derivative, {!equivalent} is Hopcroft & Karp over
+     pairs of them. Neither is bounded or interruptible; deciding
+     costs about what {!Dfa.of_tokens} costs, and [.{20}] is two
+     million states.
+     ------------------------------------------------------------------------ *)
+
+  (* Whether no string at all matches. *)
+  val is_empty_language : t -> bool
+
+  (* Whether the two denote the same language. *)
+  val equivalent : t -> t -> bool
+
   (* -- pretty-printing ----------------------------------------------------- *)
 
   val pp : Format.formatter -> t -> unit
@@ -273,9 +294,27 @@ module Regex : sig
   val to_string : t -> string
   val to_ast : t -> Ast.t
 
-  (* Whether two regexes denote the same language up to the normal
-     form's associativity, commutativity and idempotence. Exact for
-     terms differing only by those, conservative otherwise. *)
+  (* -- deciding a language ----------------------------------------------------
+
+     Exact, over the whole codespace and every construct the type
+     carries. Both lower through {!to_ast} and hand the question to
+     {!Ast}, which carries the algorithm and the cost. The cost is
+     unbounded.
+     ------------------------------------------------------------------------ *)
+
+  (* Whether no string at all matches. Not {!is_empty}, which asks
+     about the term: [a&~a] and [a.*&b.*] are empty languages it says
+     nothing about. *)
+  val is_empty_language : t -> bool
+
+  (* Whether the two denote the same language. Exact, so [a*a*] is
+     equivalent to [a*], and [(ab)*a] to [a(ba)*].
+
+     This used to be equality of the lowered terms, which is
+     equivalence up to associativity, commutativity and idempotence
+     only. That test is still [Ast.equal (to_ast a) (to_ast b)], and
+     is what a {!to_string} round trip should be checked against: an
+     equivalent term back is weaker than the same term back. *)
   val equivalent : t -> t -> bool
 
   (* -- emission ------------------------------------------------------------ *)

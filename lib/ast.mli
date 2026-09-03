@@ -40,4 +40,6 @@ val eval : t -> string -> bool
 val approx_partition : t -> Ucharset.Partition.t
 val approx_representatives : t -> int list
 val approx_charset : t -> Ucharset.t list
+val is_empty_language : t -> bool
+val equivalent : t -> t -> bool
 val pp : Format.formatter -> t -> unit
