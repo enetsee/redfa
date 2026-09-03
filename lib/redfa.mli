@@ -462,5 +462,43 @@ module Dfa : sig
      the empty language, which is a single dead state because an
      automaton still needs an initial one. Idempotent. *)
   val minimise : t -> t
+
+  (* -- emission ---------------------------------------------------------------
+
+     What a code generator needs to emit a lexer, rather than what a
+     caller needs to inspect one.
+     ------------------------------------------------------------------------ *)
+
+  (* {!transitions} clipped to [lo .. hi], dropping the entries that
+     fall outside it. A generator with a fast path over part of the
+     codespace -- one branch for a single byte of UTF-8, another for
+     the rest -- otherwise emits the whole dispatch on both sides of
+     it, though only the entries meeting that part can ever fire
+     there. Asking once per range emits each dispatch once. *)
+  val transitions_in : t -> state_id -> lo:int -> hi:int -> (Ucharset.t * state_id) list
+
+  (* The automaton as data rather than as code: [classes] are the
+     coarsest partition of the codespace the automaton distinguishes,
+     in ascending order of least codepoint, and [next] is
+     [num_states * Array.length classes] entries, row major, holding
+     the state a character of that class moves to and [-1] where there
+     is no transition.
+
+     A generator emits the classes once, maps each input character to
+     its class, and indexes [next]; {!Ucharset.to_packed_string} is
+     there to embed a class as a string constant rather than as a list
+     of interval literals. There are usually far fewer classes than
+     states -- 46 over 1739 for a lexer with 400 keywords -- so this
+     is one array where a dispatch per state is a function per state.
+
+     Not always: an automaton whose states share no structure has a
+     class per state, and the table is then their product. Count them
+     before emitting one. *)
+  type table =
+    { classes : Ucharset.t array
+    ; next : int array
+    }
+
+  val table : t -> table
   val pp : Format.formatter -> t -> unit
 end

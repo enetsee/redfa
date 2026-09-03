@@ -555,6 +555,73 @@ let minimise (dfa : t) : t =
      | None -> dfa)
 ;;
 
+(* -- emission -----------------------------------------------------------------
+
+   What a code generator needs to emit a lexer, rather than what a
+   caller needs to inspect one.
+
+   {!transitions} is one entry per block of the state's own partition,
+   which a generator turns into a chain of interval tests. Two things
+   are wrong with that as the only view. A generator with a fast path
+   for part of the codespace emits the whole chain on both sides of
+   it, though only the arms meeting that part can fire; that is
+   {!transitions_in}. And a chain per state is a function per state,
+   where the whole automaton usually distinguishes far fewer character
+   classes than it has states: 46 classes over 1739 states for a
+   lexer with 400 keywords. That is {!table}.
+   -------------------------------------------------------------------------- *)
+
+(* Transitions clipped to [lo .. hi], dropping the arms that fall
+   outside it entirely. A generator emitting a dispatch per range asks
+   once per range and emits only what can fire there. *)
+let transitions_in t id ~lo ~hi =
+  let window = Ucharset.range ~lo ~hi in
+  List.filter_map
+    (fun (cs, dst) ->
+       let clipped = Ucharset.inter cs window in
+       if Ucharset.is_empty clipped then None else Some (clipped, dst))
+    t.transitions.(id)
+;;
+
+type table =
+  { classes : Ucharset.t array
+  ; next : int array
+  }
+
+(* The classes are the coarsest partition of the codespace that every
+   state's transitions respect, so a character's class is all the
+   automaton ever needs to know about it. The complement of a state's
+   labels joins the meet as a block of its own: two characters that
+   differ in whether they have a transition at all have to land in
+   different classes.
+
+   [next] is filled by representative, one codepoint per class, since
+   a class is a subset of one arm or of none. That is
+   [states * classes] membership tests, which is the cost of the
+   result and not more. *)
+let table (t : t) : table =
+  let parts = ref [] in
+  for id = 0 to t.num_states - 1 do
+    let labels = List.map fst t.transitions.(id) in
+    let rest = Ucharset.comp (Ucharset.union_list labels) in
+    parts := Ucharset.Partition.of_blocks (rest :: labels) :: !parts
+  done;
+  let joint = Ucharset.Partition.meet_all !parts in
+  let k = Ucharset.Partition.num_blocks joint in
+  let reps = Array.of_list (Ucharset.Partition.representatives joint) in
+  let next = Array.make (t.num_states * k) (-1) in
+  for id = 0 to t.num_states - 1 do
+    let row = id * k in
+    List.iter
+      (fun (cs, dst) ->
+         for c = 0 to k - 1 do
+           if Ucharset.mem cs reps.(c) then next.(row + c) <- dst
+         done)
+      t.transitions.(id)
+  done;
+  { classes = Array.of_list (Ucharset.Partition.blocks joint); next }
+;;
+
 (* -- pretty-printing ------------------------------------------------------- *)
 
 let pp ppf t =

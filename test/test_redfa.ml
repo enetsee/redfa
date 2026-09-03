@@ -1395,6 +1395,216 @@ let () =
   check "and they are different terms" (not (same_form (cycle 63) (cycle 64)))
 ;;
 
+(* -- the emission views ---------------------------------------------------- *)
+
+(* Both views are derived from [transitions], so both are checked
+   against it rather than against each other. *)
+let check_emission ~label ~alphabet ~seed ~trials ~depth ~max_tokens =
+  let st = Random.State.make [| seed |] in
+  let name what = Printf.sprintf "%s: %s" label what in
+  let probes =
+    (* One codepoint per class boundary is what matters, but a spread
+       over the codespace catches a class that covers too much. *)
+    [ 0x00; 0x20; 0x41; 0x61; 0x7E; 0x7F; 0x80; 0xFF; 0x3BB; 0xD7FF; 0xE000; 0x10FFFF ]
+  in
+  let smaller = ref 0 in
+  for _ = 1 to trials do
+    let tokens =
+      List.init
+        (1 + Random.State.int st max_tokens)
+        (fun i -> i, fst (gen ~alphabet st depth))
+    in
+    let dfa = Dfa.of_tokens tokens in
+    let n = Dfa.num_states dfa in
+    let tbl = Dfa.table dfa in
+    let k = Array.length tbl.Dfa.classes in
+    if k < n then incr smaller;
+    (* The classes partition the codespace: disjoint, non-empty,
+       covering, and ascending by least codepoint. *)
+    check (name "no empty class") (not (Array.exists Ucharset.is_empty tbl.Dfa.classes));
+    check
+      (name "classes cover the codespace")
+      (Ucharset.equal (Ucharset.union_list (Array.to_list tbl.Dfa.classes)) Ucharset.all);
+    let mins = Array.to_list (Array.map Ucharset.min_elt_opt tbl.Dfa.classes) in
+    check (name "classes ascend") (mins = List.sort compare mins);
+    check
+      (name "classes are disjoint")
+      (let ok = ref true in
+       Array.iteri
+         (fun i a ->
+            Array.iteri
+              (fun j b ->
+                 if i < j && not (Ucharset.is_empty (Ucharset.inter a b)) then ok := false)
+              tbl.Dfa.classes)
+         tbl.Dfa.classes;
+       !ok);
+    check (name "the table is states by classes") (Array.length tbl.Dfa.next = n * k);
+    (* Every cell is the destination [transitions] gives for that
+       class, taken at its least codepoint. *)
+    Dfa.iter_states dfa (fun id ->
+      Array.iteri
+        (fun c cls ->
+           let cp = Option.get (Ucharset.min_elt_opt cls) in
+           let expected =
+             match
+               List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id)
+             with
+             | Some (_, d) -> d
+             | None -> -1
+           in
+           check
+             (name "a table cell is the transition")
+             (tbl.Dfa.next.((id * k) + c) = expected))
+        tbl.Dfa.classes);
+    (* A class is indivisible: every codepoint in it behaves the same
+       from every state, which is the property the whole table rests
+       on. Checked on the probes that fall in each class. *)
+    Dfa.iter_states dfa (fun id ->
+      let dest cp =
+        match
+          List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) (Dfa.transitions dfa id)
+        with
+        | Some (_, d) -> d
+        | None -> -1
+      in
+      Array.iteri
+        (fun c cls ->
+           let members = List.filter (Ucharset.mem cls) probes in
+           match members with
+           | [] -> ()
+           | first :: rest ->
+             check
+               (name "a class is indivisible")
+               (List.for_all (fun cp -> dest cp = dest first) rest
+                && tbl.Dfa.next.((id * k) + c) = dest first))
+        tbl.Dfa.classes);
+    (* [transitions_in] over a cover of the codespace reassembles
+       [transitions]: same destinations, same characters. *)
+    Dfa.iter_states dfa (fun id ->
+      let full = Dfa.transitions dfa id in
+      check
+        (name "clipping to everything changes nothing")
+        (let got = Dfa.transitions_in dfa id ~lo:0 ~hi:0x10FFFF in
+         List.length got = List.length full
+         && List.for_all2 (fun (a, x) (b, y) -> Ucharset.equal a b && x = y) got full);
+      let lo_half = Dfa.transitions_in dfa id ~lo:0 ~hi:0x7F
+      and hi_half = Dfa.transitions_in dfa id ~lo:0x80 ~hi:0x10FFFF in
+      check
+        (name "no empty arm survives clipping")
+        (not (List.exists (fun (cs, _) -> Ucharset.is_empty cs) (lo_half @ hi_half)));
+      check
+        (name "a clipped arm stays inside its range")
+        (List.for_all
+           (fun (cs, _) -> Ucharset.subset cs ~of_:(Ucharset.range ~lo:0 ~hi:0x7F))
+           lo_half
+         && List.for_all
+              (fun (cs, _) ->
+                 Ucharset.subset cs ~of_:(Ucharset.range ~lo:0x80 ~hi:0x10FFFF))
+              hi_half);
+      check
+        (name "the two halves are never longer than the whole")
+        (List.length lo_half <= List.length full
+         && List.length hi_half <= List.length full);
+      (* Every character keeps the destination it had. *)
+      List.iter
+        (fun cp ->
+           let half = if cp < 0x80 then lo_half else hi_half in
+           let d l =
+             match List.find_opt (fun (cs, _) -> Ucharset.mem cs cp) l with
+             | Some (_, x) -> x
+             | None -> -1
+           in
+           check (name "clipping keeps every destination") (d half = d full))
+        probes)
+  done;
+  check
+    (Printf.sprintf
+       "%s: the table is smaller than a dispatch per state (%d of %d)"
+       label
+       !smaller
+       trials)
+    (!smaller > 0)
+;;
+
+let () =
+  check_emission
+    ~label:"emit ascii"
+    ~alphabet
+    ~seed:606
+    ~trials:200
+    ~depth:3
+    ~max_tokens:4;
+  check_emission
+    ~label:"emit wide"
+    ~alphabet:wide_alphabet
+    ~seed:707
+    ~trials:150
+    ~depth:3
+    ~max_tokens:3
+;;
+
+(* The counts a generator emits against, on a lexer-shaped automaton
+   rather than a random one. The class count saturates while the state
+   count grows with the keywords, which is the whole reason to emit a
+   table: 7 states and 8 classes with no keywords, 814 and 34 with two
+   hundred. *)
+let () =
+  let base =
+    [ seq
+        (alt (range_char ~lo:'a' ~hi:'z') (singleton_char '_'))
+        (star
+           (alts
+              [ range_char ~lo:'a' ~hi:'z'
+              ; range_char ~lo:'0' ~hi:'9'
+              ; singleton_char '_'
+              ]))
+    ; plus (range_char ~lo:'0' ~hi:'9')
+    ; plus (chars (Ucharset.of_utf_8_string " \t\r\n"))
+    ; alts (List.map str [ "->"; "=="; "<=" ])
+    ]
+  in
+  let keywords n =
+    let st = Random.State.make [| 5 |] in
+    List.init n (fun _ ->
+      str
+        (String.init
+           (3 + Random.State.int st 5)
+           (fun _ -> Char.chr (Char.code 'a' + Random.State.int st 26))))
+  in
+  let measure n =
+    let dfa = Dfa.of_tokens (List.mapi (fun i r -> i, r) (base @ keywords n)) in
+    let arms = ref 0
+    and split = ref 0 in
+    Dfa.iter_states dfa (fun id ->
+      arms := !arms + (2 * List.length (Dfa.transitions dfa id));
+      split
+      := !split
+         + List.length (Dfa.transitions_in dfa id ~lo:0 ~hi:0x7F)
+         + List.length (Dfa.transitions_in dfa id ~lo:0x80 ~hi:0x10FFFF));
+    Dfa.num_states dfa, Array.length (Dfa.table dfa).Dfa.classes, !arms, !split
+  in
+  let small_states, small_classes, _, _ = measure 20 in
+  let big_states, big_classes, big_arms, big_split = measure 200 in
+  check
+    (Printf.sprintf "states grow with the keywords (%d -> %d)" small_states big_states)
+    (big_states > 5 * small_states);
+  check
+    (Printf.sprintf "the classes do not (%d -> %d)" small_classes big_classes)
+    (big_classes <= small_classes + 2);
+  check
+    (Printf.sprintf
+       "so the table is far smaller than a dispatch per state (%d states, %d classes)"
+       big_states
+       big_classes)
+    (big_states > 10 * big_classes);
+  check
+    (Printf.sprintf
+       "the range split halves the dispatch (%d -> %d arms)"
+       big_arms
+       big_split)
+    (big_split * 2 <= big_arms)
+;;
+
 (* -- state budgets --------------------------------------------------------- *)
 
 (* The unbounded forms are the bounded ones at [max_int], so agreeing
