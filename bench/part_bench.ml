@@ -3,8 +3,6 @@
 
    Run: dune exec --profile release bench/part_bench.exe *)
 
-open Redfa.Ast
-
 (* Each leaf contributes [of_set c], the two block partition
    {c, comp c} covering the codespace, and an [Alt] of n leaves meets
    all n of them. *)

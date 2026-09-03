@@ -1821,6 +1821,22 @@ let () =
 
 (* -- the intern table gives memory back ------------------------------------ *)
 
+(* Both measurements below rest on [Gc.compact] returning memory, and
+   OCaml 5.0 and 5.1 cannot: compaction was dropped in 5.0 and only
+   reintroduced in 5.2, so the call is there but reclaims nothing. The
+   library is unaffected, the weak table still collecting on its own;
+   it is the measurement that cannot see it happen, so on those two
+   runtimes the size checks are skipped and everything around them
+   still runs. *)
+let compaction_returns_memory =
+  match String.split_on_char '.' Sys.ocaml_version with
+  | major :: minor :: _ ->
+    (match int_of_string_opt major, int_of_string_opt minor with
+     | Some 5, Some (0 | 1) -> false
+     | _ -> true)
+  | _ -> true
+;;
+
 (* Entries are weak, so transient terms are collected on their own. What
    used to be retained was the bucket array around them: it was sized
    from the number of terms interned since the last resize, and only
@@ -1859,9 +1875,11 @@ let () =
   (* Before the fix this grew by about 12.5 MB at this size; after it,
      by nothing measurable. The threshold sits an order of magnitude
      clear of both. *)
-  check
-    (Printf.sprintf "intern table gives memory back (%.2f -> %.2f MB)" before after)
-    (after -. before < 4.0)
+  if compaction_returns_memory
+  then
+    check
+      (Printf.sprintf "intern table gives memory back (%.2f -> %.2f MB)" before after)
+      (after -. before < 4.0)
 ;;
 
 (* [rehash] re-measures the table only when something is interned, so a
@@ -1890,9 +1908,11 @@ let () =
   Gc.compact ();
   let cleared = live_mb () in
   (* Measured: 4.88 MB held, 0.57 MB after, against a 0.57 MB baseline. *)
-  check
-    (Printf.sprintf "clear_cache releases the table (%.2f -> %.2f MB)" held cleared)
-    (cleared < held -. 2.0);
+  if compaction_returns_memory
+  then
+    check
+      (Printf.sprintf "clear_cache releases the table (%.2f -> %.2f MB)" held cleared)
+      (cleared < held -. 2.0);
   (* The constants are put back, so interning still finds them. *)
   check "eps survives a clear" (Ast.is_eps (to_ast eps));
   check "empty survives a clear" (Ast.is_empty (to_ast empty));

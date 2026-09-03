@@ -43,7 +43,6 @@ let no_fmemo = { fs = Ucharset.empty; flo = 1; fhi = 0 }
 
 (* -- comparison and hashing ------------------------------------------------ *)
 
-let node (t : t) = t.node
 let tag (t : t) = t.tag
 let equal (a : t) (b : t) = a == b
 let compare (a : t) (b : t) = Stdlib.compare a.tag b.tag
@@ -324,19 +323,6 @@ let rec sorted_insert (t : t) = function
   | x :: rest as l ->
     let c = cmp_tag t x in
     if c = 0 then l else if c < 0 then t :: l else x :: sorted_insert t rest
-;;
-
-(* Merge two sorted-ascending lists, dropping duplicates by tag. *)
-let rec sorted_merge xs ys =
-  match xs, ys with
-  | [], l | l, [] -> l
-  | x :: xt, y :: yt ->
-    let c = cmp_tag x y in
-    if c = 0
-    then x :: sorted_merge xt yt
-    else if c < 0
-    then x :: sorted_merge xt ys
-    else y :: sorted_merge xs yt
 ;;
 
 (* Lists of two or fewer are handled without sorting. *)
