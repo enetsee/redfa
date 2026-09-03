@@ -1,5 +1,5 @@
 (* [Ast.equivalent] and [Ast.is_empty_language] against the two
-   alternatives they were chosen over: the same traversal without the
+   alternatives they were chosen over; the same traversal without the
    union-find, which is the reachable product, and deciding on an
    automaton from [Dfa.of_tokens].
 
@@ -9,14 +9,14 @@
 
    One variant per child process. [first_set] and [approx_partition]
    memoise on the node, so whichever runs first pays for both and the
-   rest read the memos -- in one process the second is two to six
-   times faster than the first, whichever one it is.
+   rest read the memos; run in one process, the second comes out two
+   to six times faster than the first, whichever one it is.
 
    Run: dune exec --profile release bench/equiv_bench.exe *)
 
 open Redfa
 
-(* Without the union-find: pairs are visited once and remembered,
+(* Without the union-find, pairs are visited once and remembered,
    which is a reachability search over the product automaton. Returns
    the answer and the pairs it expanded. *)
 let product_equivalent a b =
@@ -50,8 +50,8 @@ let product_equivalent a b =
   r, !pairs
 ;;
 
-(* A copy of [Ast.equivalent], here only to count the pairs it
-   expands; the timing column comes from the library. *)
+(* A copy of [Ast.equivalent], here to count the pairs it expands; the
+   timing column comes from the library. *)
 let hk_pairs a b =
   let parent : (int, int) Hashtbl.t = Hashtbl.create 256 in
   let size : (int, int) Hashtbl.t = Hashtbl.create 256 in
@@ -106,7 +106,7 @@ let hk_pairs a b =
 
 (* Deciding on the automaton instead. Both terms go in as tokens of
    one DFA, whose states are the pairs of residuals reachable
-   together; a state accepting one and not the other is a separating
+   together, so a state accepting one alone is a separating
    string. *)
 let dfa_equivalent r1 r2 =
   let d = Dfa.of_tokens [ 0, r1; 1, r2 ] in
@@ -122,7 +122,7 @@ let dfa_equivalent r1 r2 =
    coprime lengths are the same language through automata that share
    no state, so the product visits [p * q] pairs where the union-find
    visits [p + q]. The adversarial shape, against the four realistic
-   ones. *)
+   ones above. *)
 let cycle p =
   let open Regex in
   let a = singleton_char 'a' in
@@ -130,7 +130,7 @@ let cycle p =
 ;;
 
 (* One regex per workload, and an equivalent term the normal form
-   cannot see through: every arm intersected with [.*]. *)
+   cannot see through, every arm intersected with [.*]. *)
 let pair_of workload =
   if workload = "cycles-63x64"
   then cycle 63, cycle 64
@@ -148,9 +148,9 @@ let clock f =
   (Unix.gettimeofday () -. t0) *. 1000., r
 ;;
 
-(* One variant, in a process of its own: milliseconds, a count of
+(* One variant, in a process of its own; milliseconds, a count of
    whatever the variant explores, and whether it answered correctly.
-   Counting the pairs is done after the clock stops. *)
+   Counting the pairs happens after the clock stops. *)
 let measure mode workload =
   let r1, r2 = pair_of workload in
   let ms, count, ok =

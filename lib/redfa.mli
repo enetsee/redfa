@@ -38,12 +38,13 @@ module Ast : sig
   type t
 
   (* [tag] is the node's identity in the intern table, handed out in
-     allocation order, and [compare] and [hash] are built from it. So
-     the order is the order the nodes were first interned in, says
-     nothing about their structure, and does not survive a run: a node
-     collected and interned again ranks differently against nodes
-     interned before it. Fit for a [Map] or [Set] key within a run,
-     not for one to store or sort by. [equal] is pointer equality. *)
+     allocation order, and [compare] and [hash] are built from it. The
+     order is therefore the order the nodes were first interned in,
+     and it lasts as long as the run; a node collected and interned
+     again ranks differently against nodes interned before it. Use it
+     as a [Map] or [Set] key within a run, and reach for structure
+     where the order has to survive one. [equal] is pointer
+     equality. *)
 
   val tag : t -> int
   val equal : t -> t -> bool
@@ -119,7 +120,7 @@ module Ast : sig
 
   (* Children of a [Seq] or an [Alt], or the node in a singleton list.
      [seq_children eps] is the empty list, [eps] being the [Seq] of
-     nothing, not a list holding [eps]. *)
+     nothing. *)
   val seq_children : t -> t list
   val alt_children : t -> t list
 
@@ -140,17 +141,17 @@ module Ast : sig
 
   (* -- deciding a language ----------------------------------------------------
 
-     Emptiness and equivalence of the language, not of the term:
-     {!equal} separates [a*a*] from [a*], and {!is_empty} misses
-     [a & ~a]. Both are exact, over the whole codespace and every
-     construct the type carries.
+     Emptiness and equivalence of the language. {!equal} compares
+     terms, so it separates [a*a*] from [a*]; {!is_empty} asks about
+     the node, so [a & ~a] passes it. Both of these are exact, over
+     the whole codespace and every construct the type carries.
 
      A node and {!deriv} are a deterministic automaton, so both
-     traverse one instead of building it: {!is_empty_language} looks
+     traverse one instead of building it. {!is_empty_language} looks
      for a nullable derivative, {!equivalent} is Hopcroft & Karp over
-     pairs of them. Neither is bounded or interruptible; deciding
-     costs about what {!Dfa.of_tokens} costs, and [.*a.{20}] is two
-     million states.
+     pairs of them. Both run to completion once started, and deciding
+     costs about what {!Dfa.of_tokens} costs ([.*a.{20}] is two
+     million states).
      ------------------------------------------------------------------------ *)
 
   (* Whether no string at all matches. *)
@@ -160,14 +161,14 @@ module Ast : sig
   val equivalent : t -> t -> bool
 
   (* The same two, given up on past [max_states] states of the
-     automaton being traversed: the derivatives visited for
+     automaton being traversed; the derivatives visited for
      {!is_empty_language_within}, the pairs merged for
-     {!equivalent_within}. [None] is "no answer within that" and not
-     an answer. Pass a bound on anything a caller did not write.
+     {!equivalent_within}. [None] means "no answer within that
+     budget". Pass a bound on anything a caller did not write.
 
-     A bound of zero can still answer, where nothing has to be
-     traversed to know: [is_empty_language_within ~max_states:0 eps]
-     is [Some false], the root being nullable. *)
+     A bound of zero still answers where the root settles it, since
+     nullability is tested first ([is_empty_language_within
+     ~max_states:0 eps] is [Some false]). *)
   val is_empty_language_within : max_states:int -> t -> bool option
   val equivalent_within : max_states:int -> t -> t -> bool option
 
@@ -221,7 +222,7 @@ module Regex : sig
      Every one taking a raw [int] codepoint validates it through
      Ucharset, so a surrogate or a value outside [0 .. 0x10FFFF]
      raises [Invalid_argument]. The [_char] and [_uchar] forms take
-     scalar values already and cannot raise.
+     scalar values already, so they always succeed.
      ------------------------------------------------------------------------ *)
 
   val chars : Ucharset.t -> t
@@ -304,10 +305,10 @@ module Regex : sig
 
      Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the shorthand
      classes [\d], [\w], [\s] with their negations, and a backslash
-     before any printable ASCII character that is not a letter or a
-     digit, for that character literally. Space, the C0 controls and
-     DEL are not metacharacters, so a backslash before one is an
-     error rather than that character.
+     before any printable ASCII character outside the letters and
+     digits, for that character literally. Space, the C0 controls and
+     DEL stand for themselves, so a backslash before one is an
+     error.
      ------------------------------------------------------------------------ *)
 
   type error =
@@ -337,9 +338,9 @@ module Regex : sig
      unbounded.
      ------------------------------------------------------------------------ *)
 
-  (* Whether no string at all matches. Not {!is_empty}, which asks
-     about the term: [a&~a] and [a.*&b.*] are empty languages it says
-     nothing about. *)
+  (* Whether any string matches at all. {!is_empty} asks about the
+     term instead, so [a&~a] and [a.*&b.*] pass it while denoting
+     nothing. *)
   val is_empty_language : t -> bool
 
   (* Whether the two denote the same language. Exact, so [a*a*] is
@@ -347,13 +348,14 @@ module Regex : sig
 
      This used to be equality of the lowered terms, which is
      equivalence up to associativity, commutativity and idempotence
-     only. That test is still [Ast.equal (to_ast a) (to_ast b)], and
-     is what a {!to_string} round trip should be checked against: an
-     equivalent term back is weaker than the same term back. *)
+     alone. That test is still [Ast.equal (to_ast a) (to_ast b)], and
+     is what a {!to_string} round trip should be checked against,
+     since getting an equivalent term back is weaker than getting the
+     same one. *)
   val equivalent : t -> t -> bool
 
   (* The same two under a state budget; see {!Ast.equivalent_within}.
-     [None] is "no answer within that" and not an answer. *)
+     [None] means "no answer within that budget". *)
   val is_empty_language_within : max_states:int -> t -> bool option
   val equivalent_within : max_states:int -> t -> t -> bool option
 
@@ -407,11 +409,12 @@ module Dfa : sig
 
   (* The same, [None] if the automaton would hold more than
      [max_states] states. Construction is the operation here whose
-     cost a caller cannot see coming: [.*a.{20}] is two million
-     states, [.*a.{12}] is 8192, and a tower of complements and
+     cost a caller can least predict; [.*a.{12}] is 8192 states,
+     [.*a.{20}] is two million, and a tower of complements and
      intersections is non-elementary.
      Pass a bound on anything a caller did not write. A bound below
-     one always gives [None], an automaton needing an initial state. *)
+     one always gives [None], since an automaton has an initial
+     state. *)
   val of_tokens_within : max_states:int -> (int * Regex.t) list -> t option
 
   (* Always 0, for symmetry with {!num_states}. *)
@@ -423,13 +426,13 @@ module Dfa : sig
   val accepts : t -> state_id -> int list
 
   (* Case ids still present in this state's item set. A superset of
-     {!accepts}, and an over-approximation of what can still match: an
-     item is dropped only when its regex derives to [empty], and a
-     regex can denote the empty language without the normal form
-     saying so. {!minimise} does not tighten it, and the states
-     concerned need not be dead -- the tokens "a(b.*&c.*)" and "a"
-     give an automaton whose every state lists both, before and after,
-     though only the second can ever match. *)
+     {!accepts}, and an over-approximation of what can still match; an
+     item is dropped once its regex derives to [empty], and a regex
+     can denote the empty language while the normal form keeps it
+     live. {!minimise} leaves the approximation as it stands, and it
+     reaches live states as well as dead ones. The tokens
+     "a(b.*&c.*)" and "a" give an automaton whose every state lists
+     both, before and after, though only the second ever matches. *)
   val reaches : t -> state_id -> int list
 
   (* Outgoing transitions. Each [(charset, dest)] means any codepoint in
@@ -465,35 +468,34 @@ module Dfa : sig
 
   (* -- emission ---------------------------------------------------------------
 
-     What a code generator needs to emit a lexer, rather than what a
-     caller needs to inspect one.
+     What a code generator needs to emit a lexer, where
+     {!transitions} serves a caller inspecting one.
      ------------------------------------------------------------------------ *)
 
-  (* {!transitions} clipped to [lo .. hi], dropping the entries that
-     fall outside it. A generator with a fast path over part of the
-     codespace -- one branch for a single byte of UTF-8, another for
-     the rest -- otherwise emits the whole dispatch on both sides of
-     it, though only the entries meeting that part can ever fire
-     there. Asking once per range emits each dispatch once. *)
+  (* {!transitions} clipped to [lo .. hi], keeping the entries that
+     meet it. A generator with a fast path over part of the codespace
+     (one branch for a single byte of UTF-8, another for the rest)
+     otherwise emits the whole dispatch on both sides of it, though
+     only the entries meeting that part fire there. Asking once per
+     range emits each dispatch once. *)
   val transitions_in : t -> state_id -> lo:int -> hi:int -> (Ucharset.t * state_id) list
 
-  (* The automaton as data rather than as code: [classes] are the
-     coarsest partition of the codespace the automaton distinguishes,
-     in ascending order of least codepoint, and [next] is
-     [num_states * Array.length classes] entries, row major, holding
-     the state a character of that class moves to and [-1] where there
-     is no transition.
+  (* The automaton as data. [classes] are the coarsest partition of
+     the codespace the automaton distinguishes, in ascending order of
+     least codepoint; [next] is [num_states * Array.length classes]
+     entries, row major, holding the state a character of that class
+     moves to, and [-1] where the state stops.
 
      A generator emits the classes once, maps each input character to
-     its class, and indexes [next]; {!Ucharset.to_packed_string} is
-     there to embed a class as a string constant rather than as a list
-     of interval literals. There are usually far fewer classes than
-     states -- 46 over 1739 for a lexer with 400 keywords -- so this
-     is one array where a dispatch per state is a function per state.
+     its class, and indexes [next]; {!Ucharset.to_packed_string}
+     embeds a class as a string constant rather than a list of
+     interval literals. There are usually far fewer classes than
+     states (46 over 1739 for a lexer with 400 keywords), so this is
+     one array where a dispatch per state is a function per state.
 
-     Not always: an automaton whose states share no structure has a
-     class per state, and the table is then their product. Count them
-     before emitting one. *)
+     An automaton whose states share no structure has a class per
+     state, and the table is then their product, so count them before
+     emitting one. *)
   type table =
     { classes : Ucharset.t array
     ; next : int array

@@ -713,29 +713,29 @@ let approx_charset (r : t) : Ucharset.t list =
 
 (* -- deciding a language ------------------------------------------------------
 
-   Emptiness and equivalence of the language, not of the term:
-   [equal] separates [a*a*] from [a*], and [is_empty] misses [a & ~a].
+   Emptiness and equivalence of the language. [equal] compares terms,
+   so it separates [a*a*] from [a*]; [is_empty] asks about the node,
+   so [a & ~a] passes it.
 
-   A node and [deriv] are a deterministic automaton, so both traverse
-   one instead of building it. States are nodes, acceptance is
+   A node and [deriv] are a deterministic automaton, so both questions
+   come out of traversing one. States are nodes, acceptance is
    [nullable], the alphabet is [approx_partition]. Derivatives are
-   finite, so both terminate. Neither is bounded, and each costs about
-   what building the DFA costs.
+   finite, so both traversals end. Both are unbounded, and each costs
+   about what building the DFA costs.
    -------------------------------------------------------------------------- *)
 
-(* Raised past the budget and caught in the [_within] forms, so the
-   unbounded ones need no failure case. Nothing does arithmetic on
-   [limit] or on [max_states]: the unbounded forms pass [max_int], and
-   [max_int + 1] is negative. *)
+(* Raised past the budget and caught in the [_within] forms, leaving
+   the unbounded ones total. The unbounded forms pass [max_int], so
+   every guard compares against the limit and leaves it alone
+   ([max_int + 1] is negative). *)
 exception Budget_spent
 
-(* Reachable derivatives, until one is nullable: it accepts the empty
-   string, so the input that reached it matches. [empty] derives to
-   itself and accepts nothing, so it is pruned.
+(* Reachable derivatives, until one is nullable; a nullable derivative
+   accepts the empty string, so the input that reached it matches.
+   [empty] derives to itself and accepts nothing, so it is pruned.
 
-   [limit] caps the derivatives visited, and is [max_int] for the
-   unbounded form, which spends one integer compare per state on
-   it. *)
+   [limit] caps the derivatives visited. The unbounded form passes
+   [max_int], spending one integer compare per state on it. *)
 let is_empty_language_bounded (r : t) ~limit =
   if is_empty r
   then true
@@ -808,13 +808,13 @@ let uf_union uf a b =
 
 (* Assume the two match the same strings, then look for one that tells
    them apart. Pairs come off a stack. Sides that disagree on
-   [nullable] mean no. A pair already in one class was assumed equal,
-   so skip it. Otherwise merge, and push the derivatives, one per
-   block of the two partitions met together.
+   [nullable] settle it. A pair already in one class was assumed
+   equal, so skip it. Otherwise merge, and push the derivatives, one
+   per block of the two partitions met together.
 
-   Skipping merged pairs is what beats the reachable product: one
-   expansion per node at most, against one per pair of nodes. On
-   automata both far from minimal that is [p + q] against [p * q].
+   Skipping merged pairs is what beats the reachable product; at most
+   one expansion per node, against one per pair of nodes. On automata
+   both far from minimal that is [p + q] against [p * q].
    [(a{63})*a*] against [(a{64})*a*], both [a*], is 127 pairs and 0.11
    ms here against 5192 and 3.3 ms; level on the four token sets in
    [bench], where the automata run in lockstep.
@@ -828,7 +828,7 @@ let equivalent_bounded (a : t) (b : t) ~limit =
   else (
     let uf = uf_create 64 in
     (* The budget is tested after [nullable], so a pair that settles
-       the question is not thrown away for being one over it. *)
+       the question still answers when it falls one over. *)
     let rec go k = function
       | [] -> true
       | (x, y) :: rest ->
@@ -848,8 +848,8 @@ let equivalent_bounded (a : t) (b : t) ~limit =
             let c = Ucharset.Partition.representative p i in
             let dx = deriv x ~uchr:c
             and dy = deriv y ~uchr:c in
-            (* One node is one class already, so the pair tells us
-               nothing. Skipping it saves two [find]s. *)
+            (* One node is one class already; skipping the pair
+               saves two [find]s. *)
             if not (equal dx dy) then todo := (dx, dy) :: !todo
           done;
           go (k + 1) !todo)

@@ -396,8 +396,8 @@ let () =
     (match of_string "\\\xff" with
      | Error e -> e.pos = 1
      | Ok _ -> false);
-  (* The property behind those two: no message carries a raw byte out
-     of the source. Run over every character the round-trip alphabet
+  (* The property behind those two; every message comes back as valid
+     UTF-8, whatever the source held. Run over every character the round-trip alphabet
      covers, which is where the multi-byte ones are. *)
   let bad = ref 0 in
   Array.iter
@@ -410,7 +410,7 @@ let () =
        | Error e -> if not (is_utf8 e.msg) then incr bad)
     meta_alphabet;
   check "every escape error message is valid UTF-8" (!bad = 0);
-  (* Every ASCII byte, either side of the rule the .mli states: a
+  (* Every ASCII byte, either side of the rule the .mli states; a
      backslash before a printable non-alphanumeric is that character,
      and a backslash before space, a C0 control or DEL is an error.
      The letters and digits are left out, being the named escapes and
@@ -468,7 +468,7 @@ let () =
 
 (* Equality of the lowered terms, which is what [Regex.equivalent]
    used to be. The round trips below use it rather than [equivalent],
-   which now decides the language and would pass a printer that
+   which now decides the language and would accept a printer that
    rendered [a*] as ["a*a*"]. *)
 let same_form a b = Ast.equal (to_ast a) (to_ast b)
 
@@ -734,15 +734,15 @@ let () =
 (* -- the approximate partition's defining property -------------------------- *)
 
 (* Two codepoints in one block derive the term to the identical node.
-   The whole DFA construction reduces to this: [of_tokens] derives on
+   The whole DFA construction reduces to this; [of_tokens] derives on
    one representative per block and lets the result stand for every
-   codepoint in it, so a block that is too coarse is a wrong automaton
-   with nothing raised. It was fuzzed when the review found it and
+   codepoint in it, so a block that is too coarse gives a wrong
+   automaton silently. It was fuzzed when the review found it and
    never became a test.
 
    A block runs to millions of codepoints, so the probes are the two
-   endpoints of each of its intervals, where a boundary error would
-   show, plus members drawn at random. *)
+   endpoints of each of its intervals, where a boundary error shows,
+   plus members drawn at random. *)
 
 let interval_endpoints cs =
   let acc = ref [] in
@@ -750,7 +750,7 @@ let interval_endpoints cs =
   !acc
 ;;
 
-(* A member of [cs] at random: an interval at random, then a point
+(* A member of [cs] at random; an interval at random, then a point
    inside it. Indexing the set itself would cost its cardinal. *)
 let random_member st cs =
   let ivals = Array.of_list (Ucharset.to_intervals cs) in
@@ -804,7 +804,7 @@ let check_partition ~label ~alphabet ~seed ~trials ~depth =
            (Ucharset.min_elt_opt b = Some reps.(i)))
       blocks;
     uniform_on a blocks reps;
-    (* What [Dfa.of_tokens] actually derives on: the meet of several
+    (* What [Dfa.of_tokens] actually derives on, the meet of several
        terms' partitions, where every term has to be uniform on every
        block of the common refinement. *)
     let others = List.init 2 (fun _ -> to_ast (fst (gen ~alphabet st depth))) in
@@ -1060,9 +1060,10 @@ let correspondence (d : Dfa.t) (m : Dfa.t) =
 
 (* -- the properties -------------------------------------------------------- *)
 
-(* Case ids some reachable state accepts: what [reaches] would name if
-   it were exact. A fixpoint over the transition graph, which shares
-   nothing with the item-set projection [reaches] comes from. *)
+(* Case ids some reachable state accepts, which is what [reaches] would
+   name if it were exact. A fixpoint over the transition graph, an
+   unrelated computation to the item-set projection [reaches] comes
+   from. *)
 let matchable (d : Dfa.t) =
   let n = Dfa.num_states d in
   let out = Array.make n [] in
@@ -1168,8 +1169,8 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
     in
     (* [reaches] is documented as an over-approximation of what can
        still match, and as one that survives [minimise]. Both halves
-       are pinned: never short of what is matchable, and sometimes
-       longer, on each automaton. *)
+       are pinned; it covers what is matchable, and on some states it
+       runs longer, on each automaton. *)
     List.iter
       (fun (what, a, counter) ->
          let m = matchable a in
@@ -1283,9 +1284,9 @@ let () =
 
 (* The same decision, taken on the automaton. Both terms go in as
    tokens of one DFA, whose states are the pairs of residuals reached
-   together, so a state accepting one and not the other is a
-   separating string. Shares [deriv] with [Ast.equivalent], as
-   everything here does, but nothing of how it decides. *)
+   together, so a state accepting one alone is a separating string. It
+   shares [deriv] with [Ast.equivalent], as everything here does, and
+   decides in an unrelated way. *)
 let dfa_equivalent r1 r2 =
   let d = Dfa.of_tokens [ 0, r1; 1, r2 ] in
   let agree = ref true in
@@ -1303,11 +1304,11 @@ let dfa_empty_language r =
   Dfa.num_states m = 1 && Dfa.is_dead m 0
 ;;
 
-(* Rewritings that change the term and not the language. Each is an
-   identity over the boolean operations, which no amount of
-   flattening, sorting or dropping duplicates reaches: [Ast.equal]
-   cannot see [(r&x) | (r&~x)] as [r]. [x] is a second random term, so
-   the two sides have differently shaped automata. *)
+(* Rewritings that change the term and keep the language. Each is an
+   identity over the boolean operations, past the reach of flattening,
+   sorting and dropping duplicates, so [Ast.equal] reads
+   [(r&x) | (r&~x)] and [r] as separate terms. [x] is a second random
+   term, so the two sides have differently shaped automata. *)
 let rewrite st r x =
   match Random.State.int st 5 with
   (* r & (every string) *)
@@ -1325,13 +1326,13 @@ let rewrite st r x =
 (* Random pairs, against the reference decision on the automaton and
    against the corpus. [len] and [alphabet] fix the corpus; a corpus
    disagreement is a witness string, so it settles the answer on its
-   own and is the check that shares no decision procedure at all with
-   the traversal. *)
+   own, and it is the check that shares its decision procedure with
+   nothing here. *)
 let check_equivalence ~label ~alphabet ~len ~seed ~trials ~depth =
   let st = Random.State.make [| seed |] in
   let corp = List.map utf8 (cp_corpus ~alphabet ~len) in
   let name what = Printf.sprintf "%s: %s" label what in
-  (* Non-vacuity: how many rewritten pairs the normal form still sees
+  (* Non-vacuity, how many rewritten pairs the normal form still sees
      as different terms, and how many random pairs land either way. *)
   let rewritten_distinct = ref 0
   and random_same = ref 0

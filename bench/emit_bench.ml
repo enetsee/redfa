@@ -1,18 +1,18 @@
-(* What a code generator emits against, for the two views in
-   [Dfa]'s emission section.
+(* What a code generator emits against, for the two views in [Dfa]'s
+   emission section.
 
    A generator turns each state's [transitions] into a chain of
    interval tests, and emits that chain once per range it has a fast
-   path for -- typically one for the byte that is its own codepoint in
-   UTF-8, one for the rest. The "arms x2" column is what that costs
+   path for (typically one for the byte that is its own codepoint in
+   UTF-8, one for the rest). The "arms x2" column is what that costs
    with the whole dispatch on both sides; "split" is the same with
    [transitions_in] asked once per range.
 
-   [Dfa.table] is the other view: the classes the automaton
-   distinguishes, and a states-by-classes array. Emitting it is a
+   [Dfa.table] is the other view; the classes the automaton
+   distinguishes, and a states by classes array. Emitting it is a
    class set and a cell per pair, against an arm per transition.
 
-   Not timed. These are code sizes, and the only time here is what
+   These are code sizes rather than timings. The one time here is what
    [Dfa.table] costs to build at codegen time.
 
    Run: dune exec --profile release bench/emit_bench.exe *)

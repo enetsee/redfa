@@ -106,10 +106,10 @@ let iter_states t f =
 
 (* Joint approx partition for a state's items, the common refinement
    of each item's own. Stays in [Ucharset.Partition.t], so a chain of
-   meets never materialises an intermediate block. The loop below does
-   build every block of the result, in one [Partition.blocks] call,
-   the transitions needing them as labels. An [empty] item contributes
-   the single block covering the codespace, neutral under meet. *)
+   meets skips the intermediate blocks. The loop below builds every
+   block of the result, in one [Partition.blocks] call, the
+   transitions needing them as labels. An [empty] item contributes the
+   single block covering the codespace, neutral under meet. *)
 let approx_partition items =
   Ucharset.Partition.meet_all (List.map (fun it -> Ast.approx_partition it.regex) items)
 ;;
@@ -128,13 +128,14 @@ let step_items items ~uchr =
 ;;
 
 (* Raised past the state budget and caught in {!of_tokens_within},
-   which discards the tables built so far, so {!of_tokens} needs no
-   failure case. *)
+   which discards the tables built so far, leaving {!of_tokens}
+   total. *)
 exception Over_budget
 
-(* [max_states] caps the states of the result: one integer compare per
-   state discovered. Nothing does arithmetic on it, the unbounded form
-   passing [max_int] and [max_int + 1] being negative. *)
+(* [max_states] caps the states of the result, one integer compare per
+   state discovered. The unbounded form passes [max_int], so the guard
+   compares against it and leaves it alone ([max_int + 1] is
+   negative). *)
 let build (token_regexes : (int * Regex.t) list) ~max_states : t =
   let initial_items =
     canonicalise_items
@@ -557,23 +558,24 @@ let minimise (dfa : t) : t =
 
 (* -- emission -----------------------------------------------------------------
 
-   What a code generator needs to emit a lexer, rather than what a
-   caller needs to inspect one.
+   What a code generator needs to emit a lexer, where {!transitions}
+   serves a caller inspecting one.
 
    {!transitions} is one entry per block of the state's own partition,
-   which a generator turns into a chain of interval tests. Two things
-   are wrong with that as the only view. A generator with a fast path
-   for part of the codespace emits the whole chain on both sides of
-   it, though only the arms meeting that part can fire; that is
-   {!transitions_in}. And a chain per state is a function per state,
-   where the whole automaton usually distinguishes far fewer character
-   classes than it has states: 46 classes over 1739 states for a
-   lexer with 400 keywords. That is {!table}.
+   which a generator turns into a chain of interval tests. Two views
+   sit better with a generator. A generator with a fast path over part
+   of the codespace emits that chain on both sides of it, though only
+   the arms meeting that part can fire there; {!transitions_in} clips
+   to a range so each chain carries what fires. And a chain per state
+   is a function per state, where the whole automaton usually
+   distinguishes far fewer character classes than it has states (46
+   classes over 1739 states for a lexer with 400 keywords); {!table}
+   is those classes and one array.
    -------------------------------------------------------------------------- *)
 
-(* Transitions clipped to [lo .. hi], dropping the arms that fall
-   outside it entirely. A generator emitting a dispatch per range asks
-   once per range and emits only what can fire there. *)
+(* Transitions clipped to [lo .. hi], keeping the arms that meet it. A
+   generator emitting a dispatch per range asks once per range, and
+   emits what fires there. *)
 let transitions_in t id ~lo ~hi =
   let window = Ucharset.range ~lo ~hi in
   List.filter_map
@@ -590,15 +592,13 @@ type table =
 
 (* The classes are the coarsest partition of the codespace that every
    state's transitions respect, so a character's class is all the
-   automaton ever needs to know about it. The complement of a state's
-   labels joins the meet as a block of its own: two characters that
-   differ in whether they have a transition at all have to land in
-   different classes.
+   automaton needs to know about it. The complement of a state's
+   labels joins the meet as a block of its own, which keeps a
+   character with a transition apart from one without.
 
    [next] is filled by representative, one codepoint per class, since
-   a class is a subset of one arm or of none. That is
-   [states * classes] membership tests, which is the cost of the
-   result and not more. *)
+   a class sits inside one arm or outside them all. That is
+   [states * classes] membership tests, the size of the result. *)
 let table (t : t) : table =
   let parts = ref [] in
   for id = 0 to t.num_states - 1 do

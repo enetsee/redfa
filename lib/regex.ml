@@ -397,9 +397,9 @@ let hex_value = function
 (* [\u{HHHH}], the braces required so the digit run has an end.
 
    The digits are folded here rather than passed to [int_of_string],
-   which takes [_] as a separator: [\u{6_1}] parsed as [a]. The fold
-   stops climbing once past [max_codepoint], so a long run overflows
-   nothing and still fails the range test below. *)
+   which takes [_] as a separator, so [\u{6_1}] parsed as [a]. The
+   fold stops climbing once past [max_codepoint], so a long run stays
+   in range of an [int] and still fails the test below. *)
 let parse_unicode_escape c =
   let start = c.at - 2 in
   expect c '{' "after \\u";
@@ -425,10 +425,10 @@ let parse_unicode_escape c =
   !cp
 ;;
 
-(* Printable ASCII that is not a letter or a digit: the characters the
+(* Printable ASCII outside the letters and digits; the characters the
    grammar reserves, and the rest of the ASCII punctuation with them.
    [src] writes space as itself and a control as [\t] or [\u{HH}], so
-   nothing here ever emits a backslash before one. *)
+   a backslash before one comes from a caller writing it. *)
 let is_ascii_punct ch =
   let c = Char.code ch in
   c > 0x20
@@ -452,15 +452,14 @@ let parse_escape_cp c =
   | 'u' -> Some (parse_unicode_escape c)
   | 'd' | 'w' | 's' | 'D' | 'W' | 'S' -> None
   | ch when is_ascii_punct ch -> Some (Char.code ch)
-  (* Space, the C0 controls and DEL are not metacharacters, so a
-     backslash before one escapes nothing and is a mistake. Named by
-     codepoint, since the character itself would go into the message
-     raw. *)
+  (* Space, the C0 controls and DEL stand for themselves, so a
+     backslash before one is a mistake. Named by codepoint, which
+     keeps a control character out of the message. *)
   | ch when Char.code ch < 0x21 || Char.code ch = 0x7F ->
     fail_at start (Printf.sprintf "unknown escape: U+%04X" (Char.code ch))
   (* The byte after the backslash can be the lead of a multi-byte
-     character, so decode it. [%c] on the raw byte made an error
-     message that was not itself valid UTF-8. *)
+     character, so decode it; [%c] on the raw byte made an error
+     message that was itself malformed UTF-8. *)
   | _ ->
     let d = String.get_utf_8_uchar c.src (start + 1) in
     if not (Uchar.utf_decode_is_valid d) then fail_at (start + 1) "malformed UTF-8";
@@ -940,9 +939,9 @@ let to_oniguruma c =
 
 (* -- deciding a language --------------------------------------------------- *)
 
-(* Both lower and hand the question to {!Ast}, where the algorithm and
-   the cost are. The structural test [equivalent] used to be is still
-   [Ast.equal (to_ast a) (to_ast b)]. *)
+(* Both lower and hand the question to {!Ast}, which carries the
+   algorithm and the cost. The structural test [equivalent] used to be
+   is still [Ast.equal (to_ast a) (to_ast b)]. *)
 let is_empty_language t = Ast.is_empty_language (to_ast t)
 let equivalent a b = Ast.equivalent (to_ast a) (to_ast b)
 
