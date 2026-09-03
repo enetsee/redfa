@@ -731,6 +731,111 @@ let () =
   done
 ;;
 
+(* -- the approximate partition's defining property -------------------------- *)
+
+(* Two codepoints in one block derive the term to the identical node.
+   The whole DFA construction reduces to this: [of_tokens] derives on
+   one representative per block and lets the result stand for every
+   codepoint in it, so a block that is too coarse is a wrong automaton
+   with nothing raised. It was fuzzed when the review found it and
+   never became a test.
+
+   A block runs to millions of codepoints, so the probes are the two
+   endpoints of each of its intervals, where a boundary error would
+   show, plus members drawn at random. *)
+
+let interval_endpoints cs =
+  let acc = ref [] in
+  Ucharset.iter_intervals (fun lo hi -> acc := lo :: hi :: !acc) cs;
+  !acc
+;;
+
+(* A member of [cs] at random: an interval at random, then a point
+   inside it. Indexing the set itself would cost its cardinal. *)
+let random_member st cs =
+  let ivals = Array.of_list (Ucharset.to_list cs) in
+  let lo, hi = ivals.(Random.State.int st (Array.length ivals)) in
+  lo + Random.State.int st (hi - lo + 1)
+;;
+
+let check_partition ~label ~alphabet ~seed ~trials ~depth =
+  let st = Random.State.make [| seed |] in
+  let name what = Printf.sprintf "%s: %s" label what in
+  let probes = ref 0 in
+  let all_cardinal = Ucharset.cardinal Ucharset.all in
+  (* Every codepoint of a block derives [a] the same way as the
+     block's representative does. *)
+  let uniform_on a blocks reps =
+    Array.iteri
+      (fun i b ->
+         let expected = Ast.deriv a ~uchr:reps.(i) in
+         let sample = interval_endpoints b @ List.init 3 (fun _ -> random_member st b) in
+         List.iter
+           (fun cp ->
+              incr probes;
+              check
+                (name "one block, one derivative")
+                (Ast.equal (Ast.deriv a ~uchr:cp) expected))
+           sample)
+      blocks
+  in
+  for _ = 1 to trials do
+    let r, _ = gen ~alphabet st depth in
+    let a = to_ast r in
+    let part = Ast.approx_partition a in
+    let blocks = Array.of_list (Ast.approx_charset a) in
+    let reps = Array.of_list (Ast.approx_representatives a) in
+    let k = Ucharset.Partition.num_blocks part in
+    check (name "one charset per block") (Array.length blocks = k);
+    check (name "one representative per block") (Array.length reps = k);
+    check (name "no empty block") (not (Array.exists Ucharset.is_empty blocks));
+    check
+      (name "the blocks cover the codespace")
+      (Ucharset.equal (Ucharset.union_list (Array.to_list blocks)) Ucharset.all);
+    (* Covering, and cardinals summing to the codespace, is
+       disjointness without the quadratic check. *)
+    check
+      (name "the blocks are disjoint")
+      (Array.fold_left (fun acc b -> acc + Ucharset.cardinal b) 0 blocks = all_cardinal);
+    Array.iteri
+      (fun i b ->
+         check
+           (name "the representative is its block's least member")
+           (Ucharset.min_elt_opt b = Some reps.(i)))
+      blocks;
+    uniform_on a blocks reps;
+    (* What [Dfa.of_tokens] actually derives on: the meet of several
+       terms' partitions, where every term has to be uniform on every
+       block of the common refinement. *)
+    let others = List.init 2 (fun _ -> to_ast (fst (gen ~alphabet st depth))) in
+    let terms = a :: others in
+    let joint = Ucharset.Partition.meet_all (List.map Ast.approx_partition terms) in
+    let jblocks = Array.of_list (Ucharset.Partition.blocks joint) in
+    let jreps = Array.of_list (Ucharset.Partition.representatives joint) in
+    check
+      (name "the meet covers the codespace")
+      (Ucharset.equal (Ucharset.union_list (Array.to_list jblocks)) Ucharset.all);
+    List.iter (fun t -> uniform_on t jblocks jreps) terms
+  done;
+  check
+    (Printf.sprintf "%s: the probes are not vacuous (%d taken)" label !probes)
+    (!probes > 1000)
+;;
+
+let () =
+  check_partition ~label:"partition ascii" ~alphabet ~seed:56000 ~trials:300 ~depth:3;
+  check_partition ~label:"partition deep" ~alphabet ~seed:56001 ~trials:100 ~depth:5;
+  (* The full codespace, including both surrogate boundaries and a
+     supplementary plane, which is where a block that straddles the
+     gap would show. *)
+  check_partition
+    ~label:"partition wide"
+    ~alphabet:meta_alphabet
+    ~seed:56002
+    ~trials:200
+    ~depth:3
+;;
+
 (* -- codepoints beyond ASCII ----------------------------------------------- *)
 
 let () =
