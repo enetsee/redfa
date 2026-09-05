@@ -70,7 +70,15 @@ let meta_alphabet =
    ; 0x3BB (* two byte *)
    ; 0xD7FF (* just below the surrogates *)
    ; 0xE000 (* just above them *)
-   ; 0x10400 (* supplementary plane, four bytes *)
+   ; 0x10400
+     (* supplementary plane, four bytes *)
+     (* A digit reserves nothing in redfa's grammar, which is why this
+        array went without one. It is reserved in Oniguruma's: [{] and
+        [}] only form a repetition around one, so without a digit here
+        an emitter that stopped escaping the braces was invisible to
+        every test. The Oniguruma check below reads a second grammar,
+        so the alphabet has to cover what that one reserves too. *)
+   ; Char.code '2'
   |]
 ;;
 
@@ -544,6 +552,219 @@ let () =
     [ "\\&"; "a\\&b"; "\\~"; "\\~*"; "a\\&b|\\~" ]
 ;;
 
+(* -- the Oniguruma output against Oniguruma --------------------------------
+
+   The round trips above read [to_oniguruma]'s output back with redfa's
+   own parser. That shows redfa can read what it wrote; it cannot show
+   that Oniguruma reads it as the same language, which is the thing the
+   emitter exists to get right. The two grammars disagreeing is exactly
+   what an escaping slip looks like -- the [&] and [~] defect reparsed
+   cleanly here while denoting something else there.
+
+   Ruby's engine is Onigmo, an Oniguruma fork, so it stands in. Each
+   term crosses as its emitted source and one witness string, both hex
+   encoded so no shell or encoding layer can touch the bytes. Ruby
+   anchors with \A(?:...)\z, [eval] being a whole-string match, and
+   reports every disagreement. Skipped, loudly, where there is no ruby
+   to run: a silent skip is a test that stops testing without saying
+   so. *)
+
+let utf_8_of_cp cp =
+  let b = Buffer.create 4 in
+  Buffer.add_utf_8_uchar b (Uchar.of_int cp);
+  Buffer.contents b
+;;
+
+let hex s =
+  let b = Buffer.create (2 * String.length s) in
+  String.iter (fun c -> Buffer.add_string b (Printf.sprintf "%02x" (Char.code c))) s;
+  Buffer.contents b
+;;
+
+(* Strings over [meta_alphabet]: every one of length 0 and 1, and a
+   sample of the pairs, which is where an escape that only misfires
+   next to another character shows up. *)
+let meta_corpus =
+  let st = Random.State.make [| 4242 |] in
+  let singles = Array.to_list (Array.map utf_8_of_cp meta_alphabet) in
+  let pick () = meta_alphabet.(Random.State.int st (Array.length meta_alphabet)) in
+  let pairs = List.init 60 (fun _ -> utf_8_of_cp (pick ()) ^ utf_8_of_cp (pick ())) in
+  ("" :: singles) @ pairs |> List.sort_uniq String.compare
+;;
+
+let onig_script =
+  {ruby|
+fails = 0
+total = 0
+STDIN.each_line do |line|
+  hp, hw, exp = line.chomp.split("\t")
+  pat = [hp].pack("H*").force_encoding("UTF-8")
+  wit = [hw].pack("H*").force_encoding("UTF-8")
+  total += 1
+  begin
+    re = Regexp.new("\\A(?:" + pat + ")\\z")
+  rescue => e
+    puts "COMPILE #{pat.inspect}: #{e.class}: #{e.message}"
+    fails += 1
+    next
+  end
+  got = re.match?(wit) ? "1" : "0"
+  if got != exp
+    puts "MATCH #{pat.inspect} on #{wit.inspect}: redfa says #{exp}, onigmo #{got}"
+    fails += 1
+  end
+end
+puts "TOTAL #{total} #{fails}"
+|ruby}
+;;
+
+let have_ruby = Sys.command "ruby -e '' >/dev/null 2>&1" = 0
+
+(* One line per (term, witness): the emitted source, the witness, and
+   what [eval] answers for the term the source was emitted from. *)
+let onig_rows ~alphabet ~witnesses ~seed ~n =
+  let st = Random.State.make [| seed |] in
+  let rows = Buffer.create (1 lsl 16) in
+  let terms = ref 0 in
+  for _ = 1 to n do
+    let r, _ = gen ~alphabet st 3 in
+    match to_oniguruma r with
+    (* Complement, a non-charset intersection and the empty language
+       have no Oniguruma form; the emitter says so and means it. *)
+    | Error _ -> ()
+    | Ok oni ->
+      incr terms;
+      let a = to_ast r in
+      List.iter
+        (fun w ->
+           Buffer.add_string rows (hex oni);
+           Buffer.add_char rows '\t';
+           Buffer.add_string rows (hex w);
+           Buffer.add_char rows '\t';
+           Buffer.add_string rows (if Ast.eval a w then "1" else "0");
+           Buffer.add_char rows '\n')
+        witnesses
+  done;
+  !terms, Buffer.contents rows
+;;
+
+let run_onig ~label ~rows =
+  let script = Filename.temp_file "redfa_onig" ".rb" in
+  let data = Filename.temp_file "redfa_onig" ".tsv" in
+  let out = Filename.temp_file "redfa_onig" ".out" in
+  let write path s =
+    let oc = open_out_bin path in
+    output_string oc s;
+    close_out oc
+  in
+  write script onig_script;
+  write data rows;
+  let rc =
+    Sys.command
+      (Printf.sprintf
+         "ruby %s < %s > %s 2>&1"
+         (Filename.quote script)
+         (Filename.quote data)
+         (Filename.quote out))
+  in
+  let lines =
+    let ic = open_in_bin out in
+    let rec go acc =
+      match input_line ic with
+      | l -> go (l :: acc)
+      | exception End_of_file ->
+        close_in ic;
+        List.rev acc
+    in
+    go []
+  in
+  List.iter Sys.remove [ script; data; out ];
+  check (Printf.sprintf "%s: ruby ran" label) (rc = 0);
+  let total =
+    List.filter (fun l -> String.length l >= 5 && String.sub l 0 5 = "TOTAL") lines
+  in
+  let bad = List.filter (fun l -> not (List.mem l total)) lines in
+  (* Report the disagreements themselves, capped, then the count. *)
+  List.iteri (fun i l -> if i < 10 then check (Printf.sprintf "%s: %s" label l) false) bad;
+  check
+    (Printf.sprintf "%s: %d disagreements with onigmo" label (List.length bad))
+    (bad = []);
+  match total with
+  | [ t ] -> Printf.printf "  %s: onigmo agreed, %s\n" label t
+  | _ -> check (Printf.sprintf "%s: ruby produced no TOTAL line" label) false
+;;
+
+(* The constructs Oniguruma reserves and redfa does not, as literal
+   text that has to survive emission meaning itself. Leaving these to
+   the generator is a coin flip -- [{2}] needs three specific
+   codepoints adjacent and in order -- so they are named. Each goes
+   over twice: as a [str], where the danger is outside a class, and as
+   the set of its characters, where [\[:] would open a POSIX bracket. *)
+let onig_adversarial_rows () =
+  let literals =
+    [ "a{2}" (* a repetition, if the braces go out bare *)
+    ; "{2}"
+    ; "a{2,3}"
+    ; "a{,3}"
+    ; "[:alpha:]" (* a POSIX bracket, if [ and : go out bare *)
+    ; "^abc$" (* anchors, if ^ and $ go out bare *)
+    ; "a.b"
+    ; "a|b"
+    ; "(?:a)"
+    ; "a**"
+    ; "\\d"
+    ; "a&b"
+    ; "~a"
+    ; "a-b"
+    ]
+  in
+  let witnesses =
+    literals
+    @ [ ""; "a"; "aa"; "aaa"; "ab"; "abc"; "alpha"; ":"; "["; "]"; "2"; "-"; "."; "|" ]
+    |> List.sort_uniq String.compare
+  in
+  let rows = Buffer.create 4096 in
+  let terms = ref 0 in
+  List.iter
+    (fun lit ->
+       List.iter
+         (fun r ->
+            match to_oniguruma r with
+            | Error _ -> ()
+            | Ok oni ->
+              incr terms;
+              let a = to_ast r in
+              List.iter
+                (fun w ->
+                   Buffer.add_string rows (hex oni);
+                   Buffer.add_char rows '\t';
+                   Buffer.add_string rows (hex w);
+                   Buffer.add_char rows '\t';
+                   Buffer.add_string rows (if Ast.eval a w then "1" else "0");
+                   Buffer.add_char rows '\n')
+                witnesses)
+         [ str lit; chars (Ucharset.of_utf_8_string lit) ])
+    literals;
+  !terms, Buffer.contents rows
+;;
+
+let () =
+  if not have_ruby
+  then
+    Printf.printf
+      "  SKIPPED: no ruby on PATH, so to_oniguruma is checked only against redfa's own \
+       parser\n"
+  else (
+    let terms_a, rows_a = onig_rows ~alphabet ~witnesses:corpus ~seed:31337 ~n:600 in
+    run_onig ~label:(Printf.sprintf "onigmo/ascii (%d terms)" terms_a) ~rows:rows_a;
+    let terms_m, rows_m =
+      onig_rows ~alphabet:meta_alphabet ~witnesses:meta_corpus ~seed:90210 ~n:600
+    in
+    run_onig ~label:(Printf.sprintf "onigmo/meta (%d terms)" terms_m) ~rows:rows_m;
+    let terms_x, rows_x = onig_adversarial_rows () in
+    run_onig ~label:(Printf.sprintf "onigmo/reserved (%d terms)" terms_x) ~rows:rows_x)
+;;
+
 (* -- the printers over the whole public type ------------------------------- *)
 
 (* [=] on a [Regex.t] compares the [Ucharset.t] payloads structurally.
@@ -681,6 +902,14 @@ let () =
          (Printf.sprintf "Ast.str rejects %S" s)
          (match Ast.str s with
           | exception Invalid_argument _ -> true
+          | _ -> false);
+       (* Matching is the other half of the same contract: the bytes
+          [str] refuses to build a term from are the bytes [eval]
+          refuses to match one against. *)
+       check
+         (Printf.sprintf "Ast.eval rejects %S" s)
+         (match Ast.eval Ast.any s with
+          | exception Invalid_argument _ -> true
           | _ -> false))
     [ "\xff\xfe" (* not UTF-8 at all *)
     ; "\xc3" (* truncated two byte sequence *)
@@ -698,7 +927,38 @@ let () =
     "Regex.str still takes valid text"
     (Ast.eval (to_ast (str "\xce\xbbx")) "\xce\xbbx");
   check "Ast.str still takes valid text" (Ast.eval (Ast.str "\xce\xbbx") "\xce\xbbx");
-  check "str of the empty string is eps" (is_eps (str ""))
+  check "str of the empty string is eps" (is_eps (str ""));
+  (* The defect itself: every byte that cannot stand alone decoded to
+     U+FFFD, so a regex for U+FFFD took all 128 of them. *)
+  let r_fffd = Ast.str fffd in
+  let taken =
+    List.filter
+      (fun i ->
+         match Ast.eval r_fffd (String.make 1 (Char.chr i)) with
+         | matched -> matched
+         | exception Invalid_argument _ -> false)
+      (List.init 128 (fun i -> i + 0x80))
+  in
+  check
+    (Printf.sprintf "no lone bad byte matches U+FFFD (%d of 128 did)" (List.length taken))
+    (taken = []);
+  (* And the answer is a property of the string, not of the term it
+     meets. [eval] gives up as soon as the residual dies, so a check
+     made during the fold would let [empty] and a short-circuiting
+     [Seq] through while [any] raised. *)
+  List.iter
+    (fun (name, r) ->
+       check
+         (Printf.sprintf "Ast.eval %s raises on a bad byte" name)
+         (match Ast.eval r "\xff" with
+          | exception Invalid_argument _ -> true
+          | _ -> false))
+    [ "empty", Ast.empty
+    ; "eps", Ast.eps
+    ; "any", Ast.any
+    ; "a", Ast.str "a"
+    ; "a term that dies on the first character", Ast.seqs [ Ast.str "a"; Ast.str "b" ]
+    ]
 ;;
 
 (* -- the first-set guard never rejects a live codepoint --------------------- *)

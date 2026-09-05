@@ -918,6 +918,7 @@ let pp ppf t = pp_prec 0 ppf t
 (* Fold [deriv] over the codepoints of [s], stopping early once the
    residual is [empty] and nothing can bring it back. *)
 let eval (r : t) (s : string) =
+  if not (String.is_valid_utf_8 s) then invalid_arg "Redfa.Ast.eval: malformed UTF-8";
   let n = String.length s in
   let rec go r i =
     if is_empty r

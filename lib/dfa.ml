@@ -597,8 +597,14 @@ type table =
    character with a transition apart from one without.
 
    [next] is filled by representative, one codepoint per class, since
-   a class sits inside one arm or outside them all. That is
-   [states * classes] membership tests, the size of the result. *)
+   a class sits inside one arm or outside them all: class [c] is
+   inside [cs] exactly when [reps.(c)] is. [reps] ascends, so each of
+   an arm's intervals contributes a contiguous run of it, found by
+   binary search — the work is one search per interval plus one
+   write per cell that has a destination. Testing every class against
+   every arm instead costs [arms * classes], which on an automaton
+   whose states share little structure is the whole table for the
+   handful of cells per row that are not [-1]. *)
 let table (t : t) : table =
   let parts = ref [] in
   for id = 0 to t.num_states - 1 do
@@ -609,14 +615,29 @@ let table (t : t) : table =
   let joint = Ucharset.Partition.meet_all !parts in
   let k = Ucharset.Partition.num_blocks joint in
   let reps = Array.of_list (Ucharset.Partition.representatives joint) in
+  (* First index with [reps.(i) >= lo], or [k]. *)
+  let lower_bound lo =
+    let l = ref 0
+    and r = ref k in
+    while !l < !r do
+      let m = (!l + !r) lsr 1 in
+      if reps.(m) < lo then l := m + 1 else r := m
+    done;
+    !l
+  in
   let next = Array.make (t.num_states * k) (-1) in
   for id = 0 to t.num_states - 1 do
     let row = id * k in
     List.iter
       (fun (cs, dst) ->
-         for c = 0 to k - 1 do
-           if Ucharset.mem cs reps.(c) then next.(row + c) <- dst
-         done)
+         Ucharset.iter_intervals
+           (fun lo hi ->
+              let i = ref (lower_bound lo) in
+              while !i < k && reps.(!i) <= hi do
+                next.(row + !i) <- dst;
+                incr i
+              done)
+           cs)
       t.transitions.(id)
   done;
   { classes = Array.of_list (Ucharset.Partition.blocks joint); next }
