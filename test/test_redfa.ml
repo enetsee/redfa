@@ -1971,6 +1971,45 @@ let () =
     (big_split * 2 <= big_arms)
 ;;
 
+(* -- what transitions_in does with the bounds it is given ------------------ *)
+
+(* The clipping window goes through [Ucharset.range], which validates
+   both ends whether or not the range is empty. A generator slicing
+   the codespace at arbitrary offsets meets that, so it is part of the
+   contract rather than an implementation detail leaking out. *)
+let () =
+  let dfa = Dfa.of_tokens [ 0, str "ab"; 1, plus (range ~lo:0x20 ~hi:0x10FFFF) ] in
+  let raises f =
+    match f () with
+    | _ -> false
+    | exception Invalid_argument _ -> true
+  in
+  check "transitions_in is empty when lo > hi" (Dfa.transitions_in dfa 0 ~lo:5 ~hi:1 = []);
+  check
+    "transitions_in raises on a surrogate lo"
+    (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0xD800 ~hi:0xE000));
+  check
+    "transitions_in raises on a surrogate hi"
+    (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0x41 ~hi:0xDFFF));
+  check
+    "transitions_in raises below the codespace"
+    (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:(-1) ~hi:0x41));
+  check
+    "transitions_in raises above the codespace"
+    (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0x41 ~hi:0x110000));
+  check
+    "an empty range still validates its bounds"
+    (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0xE000 ~hi:0xD800));
+  (* Straddling the block is fine, which is what keeps a caller
+     splitting by UTF-8 length clear of all of the above. *)
+  check
+    "a window straddling the surrogates is accepted"
+    (not (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0x800 ~hi:0xFFFF)));
+  check
+    "and so is the whole codespace"
+    (not (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0 ~hi:0x10FFFF)))
+;;
+
 (* -- state budgets --------------------------------------------------------- *)
 
 (* The unbounded forms are the bounded ones at [max_int], so agreeing
