@@ -1,6 +1,7 @@
-(* Prices [Ucharset.mem], which the [first_set] guard in [deriv] pays
-   on every child it prunes. The interval counts run from a single
-   range to one per rule of a wide alternation.
+(* Measures [Ucharset.mem], which [deriv] calls on a term's first set
+   whenever the codepoint lies within the set's bounds; a miss returns
+   [empty] without descending into the term. The interval counts range
+   from one to one per rule of a wide alternation.
 
    Run: dune exec --profile release bench/mem_bench.exe *)
 
@@ -11,7 +12,8 @@ let set_of_n n =
        Ucharset.range ~lo:(0x20000 + (i * 8)) ~hi:(0x20000 + (i * 8) + 3)))
 ;;
 
-(* Probes that mostly miss, which is the pruned-guard case. *)
+(* Probe codepoints, mostly outside the set: the case where the guard
+   in [deriv] returns [empty]. *)
 let probes = Array.init 4096 (fun i -> 0x20000 + (i * 5) + 4)
 
 let bench n =

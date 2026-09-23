@@ -1,17 +1,17 @@
 (* -- surface syntax -----------------------------------------------------------
 
-   The regex users write, keeping the shape they wrote it in. Two ways
-   out:
+   The regex as users write it, keeping the structure they wrote. Two
+   conversions from it:
 
-   1. [to_ast] expands into the normal form the engine derives over.
-      The expansion is structural, a constructor at a time.
+   1. [to_ast] converts to the normal form the engine takes
+      derivatives of, one constructor at a time.
 
-   2. [to_oniguruma] emits regex source, traversing the tree directly.
-      [Plus], [Opt] and [Neg_chars] are separate constructors here, so
-      they map straight to [+], [?] and [\[^...\]].
+   2. [to_oniguruma] emits regex source by traversing the tree
+      directly. [Plus], [Opt] and [Neg_chars] are separate constructors
+      here, so they map directly to [+], [?] and [\[^...\]].
 
-   Smart constructors take the local algebraic simplifications
-   ([seq empty x = empty], [alt empty x = x] and so on) and leave the
+   Smart constructors apply local algebraic simplifications
+   ([seq empty x = empty], [alt empty x = x] and so on) and keep the
    rest as written.
    -------------------------------------------------------------------------- *)
 
@@ -68,9 +68,9 @@ let not_range_uchar ~lo ~hi = not_chars (Ucharset.range_uchar ~lo ~hi)
 
 (* -- character class helpers -------------------------------------------------
 
-   The common shapes of a single codepoint class, so building one does
-   not mean reaching for [Ucharset]. Unsuffixed takes codepoints, as
-   [singleton] and [range] do.
+   Constructors for common single-codepoint classes, built from lists
+   and ranges without calling [Ucharset] directly. The unsuffixed
+   versions take codepoints, as [singleton] and [range] do.
    -------------------------------------------------------------------------- *)
 
 let chars_of_list cps = chars (Ucharset.of_list cps)
@@ -114,10 +114,10 @@ let one_of_uchar ?(singles = []) ?(ranges = []) () =
        (ranges_set (fun lo hi -> Ucharset.range_uchar ~lo ~hi) ranges))
 ;;
 
-(* [String.get_utf_8_uchar] answers U+FFFD on a bad byte rather than
-   failing, which would make [str] silently denote a regex the caller
-   did not write. [of_string] rejects the same bytes, so this does
-   too. *)
+(* [String.get_utf_8_uchar] returns U+FFFD for malformed bytes. Using
+   that result would make [str] match a U+FFFD the caller did not
+   write, so [str] raises on malformed UTF-8, as [of_string] reports
+   an error for it. *)
 let str s =
   let cs = ref []
   and i = ref 0
@@ -170,11 +170,11 @@ let alt_children = function
 let alts ts =
   let flat = List.concat_map alt_children ts in
   let nonemp = List.filter (fun t -> not (is_empty t)) flat in
-  (* Merge the positive [Chars] children into one and leave it where
-     the first of them sat, so [alt (singleton_char 'a')
-     (singleton_char 'b')] emits [\[ab\]]. [Neg_chars] children stay as
-     they are: folding one through its complement turns [\[^b\]] into a
-     class spanning the codespace. *)
+  (* Merge the positive [Chars] children into one, placed at the
+     position of the first, so [alt (singleton_char 'a')
+     (singleton_char 'b')] emits [\[ab\]]. [Neg_chars] children are kept
+     separate: merging one means converting it to its complement, which
+     turns [\[^b\]] into ranges spanning the codespace. *)
   let positives =
     List.filter_map
       (function
@@ -205,7 +205,7 @@ let alts ts =
 
 let alt a b = alts [ a; b ]
 
-(* A star absorbs an inner star, plus or opt. *)
+(* The star of [Star x], [Plus x] or [Opt x] is [Star x]. *)
 let star t =
   if is_empty t || is_eps t
   then eps
@@ -216,8 +216,8 @@ let star t =
     | _ -> Star t)
 ;;
 
-(* A plus over a star or a plus is that same term; over an opt it
-   widens to a star. *)
+(* The plus of a [Star] or [Plus] is that term unchanged, and the plus
+   of [Opt x] is [Star x]. *)
 let plus t =
   if is_empty t
   then empty
@@ -230,8 +230,8 @@ let plus t =
     | _ -> Plus t)
 ;;
 
-(* An opt over a star or an opt is that same term; over a plus it
-   widens to a star. *)
+(* The opt of a [Star] or [Opt] is that term unchanged, and the opt
+   of [Plus x] is [Star x]. *)
 let opt t =
   if is_empty t || is_eps t
   then eps
@@ -247,8 +247,8 @@ let complement = function
   | t -> Complement t
 ;;
 
-(* Whichever spelling of [c] has fewer intervals, so an intersection of
-   negated classes stays negated. *)
+(* [Chars c] or [Neg_chars (comp c)], whichever has fewer intervals,
+   so intersecting negated classes gives a negated class. *)
 let chars_or_neg c =
   let d = Ucharset.comp c in
   if Ucharset.num_intervals d < Ucharset.num_intervals c then Neg_chars d else chars c
@@ -288,7 +288,7 @@ let inter a b = inters [ a; b ]
 let rec to_ast = function
   | Chars chars -> Ast.chars chars
   | Neg_chars chars ->
-    (* Any single codepoint outside [c], so the set's complement. *)
+    (* [Neg_chars chars] matches any single codepoint outside [chars]. *)
     Ast.chars (Ucharset.comp chars)
   | Eps -> Ast.eps
   | Seq xs -> Ast.seqs (List.map to_ast xs)
@@ -325,10 +325,10 @@ let rec is_nullable = function
    loosest first, matching [prec_of]. An empty concatenation is [eps],
    so [()] and the branches of [a||b] parse.
 
-   Escapes are [\t], [\n], [\r], [\u{HHHH}], the shorthand classes
-   [\d], [\w], [\s] and their negations, and a backslash before any
-   ASCII punctuation for that character literally. Inside a class,
-   [\]] and [\-] carry their literal.
+   Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the
+   shorthand classes [\d], [\w], [\s] and their negations, and a
+   backslash before any ASCII punctuation, which matches that character.
+   Inside a class, [\]] and [\-] match the literal character.
    -------------------------------------------------------------------------- *)
 
 type error =
@@ -373,7 +373,7 @@ let expect c ch what =
   then fail c (Printf.sprintf "expected %C %s, found %s" ch what (describe c))
 ;;
 
-(* Shorthand classes, over the ASCII ranges they conventionally name. *)
+(* The sets for [\d], [\w] and [\s], restricted to ASCII. *)
 let digit_set = Ucharset.range ~lo:(Char.code '0') ~hi:(Char.code '9')
 
 let word_set =
@@ -394,12 +394,12 @@ let hex_value = function
   | _ -> None
 ;;
 
-(* [\u{HHHH}], the braces required so the digit run has an end.
+(* [\u{HHHH}]. The braces are required to mark where the digits end.
 
-   The digits are folded here rather than passed to [int_of_string],
-   which takes [_] as a separator, so [\u{6_1}] parsed as [a]. The
-   fold stops climbing once past [max_codepoint], so a long run stays
-   in range of an [int] and still fails the test below. *)
+   The digits are accumulated here because [int_of_string] accepts [_]
+   as a separator and would parse [\u{6_1}] as [a]. Once the value
+   exceeds 0x10FFFF further digits are not added, so a long run cannot
+   overflow an [int] and still fails the range check below. *)
 let parse_unicode_escape c =
   let start = c.at - 2 in
   expect c '{' "after \\u";
@@ -425,10 +425,11 @@ let parse_unicode_escape c =
   !cp
 ;;
 
-(* Printable ASCII outside the letters and digits; the characters the
-   grammar reserves, and the rest of the ASCII punctuation with them.
-   [src] writes space as itself and a control as [\t] or [\u{HH}], so
-   a backslash before one comes from a caller writing it. *)
+(* Printable ASCII other than space, letters and digits: the characters
+   the grammar reserves plus the remaining ASCII punctuation. Space and
+   controls are excluded because [src] writes space unescaped and a
+   control as [\t] or [\u{HH}], so a backslash before one appears only
+   in hand-written input, and is reported as an error. *)
 let is_ascii_punct ch =
   let c = Char.code ch in
   c > 0x20
@@ -438,8 +439,8 @@ let is_ascii_punct ch =
 ;;
 
 (* Escapes yielding a single codepoint. A shorthand class returns
-   [None] here and is handled by the caller, which knows whether a set
-   is admissible at that position. *)
+   [None] and the caller builds the set, because whether a set is
+   allowed depends on position: a set cannot end a range in a class. *)
 let parse_escape_cp c =
   let start = c.at - 1 in
   if eof c then fail_at start "trailing backslash";
@@ -452,14 +453,14 @@ let parse_escape_cp c =
   | 'u' -> Some (parse_unicode_escape c)
   | 'd' | 'w' | 's' | 'D' | 'W' | 'S' -> None
   | ch when is_ascii_punct ch -> Some (Char.code ch)
-  (* Space, the C0 controls and DEL stand for themselves, so a
-     backslash before one is a mistake. Named by codepoint, which
-     keeps a control character out of the message. *)
+  (* Space, the C0 controls and DEL are written unescaped, so a
+     backslash before one is an error. The message gives the codepoint
+     number so it contains no raw control character. *)
   | ch when Char.code ch < 0x21 || Char.code ch = 0x7F ->
     fail_at start (Printf.sprintf "unknown escape: U+%04X" (Char.code ch))
-  (* The byte after the backslash can be the lead of a multi-byte
-     character, so decode it; [%c] on the raw byte made an error
-     message that was itself malformed UTF-8. *)
+  (* The byte after the backslash can start a multi-byte character,
+     so decode the whole character for the message; printing the raw
+     byte would make the message malformed UTF-8. *)
   | _ ->
     let d = String.get_utf_8_uchar c.src (start + 1) in
     if not (Uchar.utf_decode_is_valid d) then fail_at (start + 1) "malformed UTF-8";
@@ -651,9 +652,9 @@ let prec_of = function
 
 (* -- rendering ----------------------------------------------------------------
 
-   The source form {!of_string} reads back. Escapes the characters the
-   grammar gives meaning to, and parenthesises by the same precedence
-   {!pp} uses.
+   Writes the source syntax {!of_string} parses. Characters with a
+   special meaning in the grammar are escaped, and subterms are
+   parenthesised by [prec_of].
    -------------------------------------------------------------------------- *)
 
 let src_cp ~in_class buf cp =
@@ -693,8 +694,8 @@ let src_class ~negated buf cs =
   Buffer.add_char buf ']'
 ;;
 
-(* The empty language has no literal of its own, so it goes out as a
-   class negating the whole codespace. *)
+(* The source syntax has no literal for the empty language, so it is
+   written as the negated class of every codepoint. *)
 let src_charset buf cs =
   if Ucharset.is_empty cs
   then src_class ~negated:true buf Ucharset.all
@@ -731,11 +732,10 @@ let rec src prec buf t =
       then Buffer.add_char buf '.'
       else src_class ~negated:true buf cs
     | Eps -> Buffer.add_string buf "()"
-    (* An empty alternation is the empty language and an empty
-       intersection is every string, which is what [to_ast] gives
-       them. Neither is reachable through the smart constructors, but
-       both are constructible, and [sep] over no children would render
-       each as the empty source, which reads back as [eps]. *)
+    (* [Alt []] matches no string and [Inter []] matches every string,
+       as in [to_ast]. The smart constructors never build either, but
+       the constructors can be applied directly, and [sep] over no
+       children would write the empty source, which parses as [eps]. *)
     | Alt [] -> src_charset buf Ucharset.empty
     | Inter [] -> Buffer.add_string buf ".*"
     | Seq xs -> sep None 3 xs
@@ -765,9 +765,9 @@ let to_string t =
 
 exception Emission_failed of string
 
-(* Tab, newline and carriage return go out as [\t], [\n] and [\r].
-   Other codepoints outside printable ASCII take the [\u\{HHHH\}]
-   form. *)
+(* Emits [cp] inside a bracket class. Tab, newline and carriage return
+   are emitted as [\t], [\n] and [\r], and other codepoints outside
+   printable ASCII as [\u\{HHHH\}]. *)
 let cp_in_charset buf cp =
   match cp with
   | 0x09 -> Buffer.add_string buf "\\t"
@@ -793,9 +793,10 @@ let cp_outside_charset buf cp =
   | _ when cp >= 0x20 && cp <= 0x7E ->
     let c = Char.chr cp in
     (match c with
-     (* [&] and [~] are redfa's intersection and complement operators, so
-        an unescaped one reparses as a different language, not a literal.
-        Oniguruma takes a backslash before either as the character. *)
+     (* [&] and [~] are redfa's intersection and complement operators,
+        so they are escaped for the output to parse back through
+        {!of_string} as literals. Oniguruma treats [\&] and [\~] as the
+        literal characters. *)
      | '\\'
      | '.'
      | '['
@@ -863,8 +864,8 @@ let emit_charset buf cs =
     else emit_charset_brackets ~negated:false buf cs)
 ;;
 
-(* [Neg_chars cs] denotes [comp cs]. [emit_charset] negates it back if
-   that's shorter. *)
+(* [Neg_chars cs] matches [comp cs]. [emit_charset] emits that as a
+   negated class when it has fewer intervals. *)
 let emit_charset_negated buf cs = emit_charset buf (Ucharset.comp cs)
 
 (* Same as [Ast.narrows], on this syntax tree: the set of length-one
@@ -932,8 +933,9 @@ let rec emit_top buf c =
     emit_atom buf x;
     Buffer.add_char buf '?'
   | Complement _ ->
-    (* A complement takes in the empty string and strings of any
-       length, which Oniguruma has no form for. *)
+    (* Oniguruma has no language complement. [Complement x] matches
+       every string of any length that [x] does not, including [""],
+       so it is not a character class either. *)
     raise
       (Emission_failed
          "complement is over the language, which Oniguruma has no form for; for a \
@@ -962,8 +964,8 @@ and emit_factor buf c =
 and emit_atom buf c =
   match c with
   | Chars _ | Neg_chars _ -> emit_top buf c
-  (* An Inter that emits as a charset is atomic too, so a [*] after
-     it needs no group. *)
+  (* An [Inter] that [as_charset] converts is emitted as a single
+     class, so a following [*] needs no group. *)
   | Inter _ when Option.is_some (as_charset c) -> emit_top buf c
   | _ ->
     Buffer.add_string buf "(?:";
@@ -982,9 +984,9 @@ let to_oniguruma c =
 
 (* -- deciding a language --------------------------------------------------- *)
 
-(* Both lower and hand the question to {!Ast}, which carries the
-   algorithm and the cost. The structural test [equivalent] used to be
-   is still [Ast.equal (to_ast a) (to_ast b)]. *)
+(* These convert with [to_ast] and call the {!Ast} decision
+   procedures. For a structural comparison, use
+   [Ast.equal (to_ast a) (to_ast b)]. *)
 let is_empty_language t = Ast.is_empty_language (to_ast t)
 let equivalent a b = Ast.equivalent (to_ast a) (to_ast b)
 
@@ -1014,13 +1016,15 @@ let rec pp_prec prec ppf t =
   else (
     match t with
     | Chars c -> Ucharset.pp ppf c
-    (* [^] for the set complement, [~] for the language complement:
-       [Neg_chars c] and [Complement (Chars c)] denote different
-       things and used to print alike. *)
+    (* [^] marks set complement and [~] language complement:
+       [Neg_chars c] matches one codepoint outside [c], and
+       [Complement (Chars c)] matches that plus [""] and every string
+       of two or more codepoints. *)
     | Neg_chars c -> Format.fprintf ppf "^%a" Ucharset.pp c
     | Eps -> Format.fprintf ppf "ε"
-    (* Both would otherwise print as nothing, which is what [Seq []]
-       prints and is the language [eps], not these. *)
+    (* Printed as symbols because the list printer over no children
+       prints nothing, which is how [Seq []], the language [eps],
+       prints. *)
     | Alt [] -> Format.fprintf ppf "∅"
     | Inter [] -> Format.fprintf ppf "Σ*"
     | Seq xs ->

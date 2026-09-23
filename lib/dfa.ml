@@ -1,10 +1,10 @@
 (* DFA construction by item-set derivative with state memoisation,
-   following relex's [Dfa.of_rule] shape over stdlib and arrays.
+   structured like relex's [Dfa.of_rule], using the stdlib and arrays.
 
    A state is a sorted-distinct list of [{case_id; regex}] items,
-   compared on [regex.tag], which hash-consing makes canonical. A
-   worklist drives discovery, and its tables become flat arrays once
-   it drains. *)
+   compared on [regex.tag], which hash-consing makes canonical. States
+   are discovered from a worklist, and once it is empty the growable
+   tables are copied into flat arrays. *)
 
 type state_id = int
 
@@ -55,7 +55,7 @@ end
 
 module State_table = Hashtbl.Make (State_key)
 
-(* Dense storage indexed by state id. Ids are handed out
+(* Dense storage indexed by state id. Ids are assigned
    sequentially from zero, so these are array indices. Grows by
    doubling. *)
 type 'a vec =
@@ -105,18 +105,19 @@ let iter_states t f =
 (* -- construction ---------------------------------------------------------- *)
 
 (* Joint approx partition for a state's items, the common refinement
-   of each item's own. Stays in [Ucharset.Partition.t], so a chain of
-   meets skips the intermediate blocks. The loop below builds every
-   block of the result, in one [Partition.blocks] call, the
-   transitions needing them as labels. An [empty] item contributes the
-   single block covering the codespace, neutral under meet. *)
+   of each item's own. The result is a [Ucharset.Partition.t], so the
+   chain of meets never builds the intermediate blocks as charsets.
+   [build] then builds every block of the result in one
+   [Partition.blocks] call, because each block is a transition label.
+   The partition of [empty] is the single block covering the
+   codespace, the identity for meet. *)
 let approx_partition items =
   Ucharset.Partition.meet_all (List.map (fun it -> Ast.approx_partition it.regex) items)
 ;;
 
 (* Derive every item's regex on [uchr], dropping items that collapse
    to [empty] (no path to acceptance through them). The accumulator
-   comes out reversed, which is fine, [canonicalise_items] sorts. *)
+   is in reverse order; [canonicalise_items] sorts it. *)
 let step_items items ~uchr =
   let rec go acc = function
     | [] -> acc
@@ -127,15 +128,15 @@ let step_items items ~uchr =
   canonicalise_items (go [] items)
 ;;
 
-(* Raised past the state budget and caught in {!of_tokens_within},
-   which discards the tables built so far, leaving {!of_tokens}
-   total. *)
+(* Raised when construction exceeds the state budget. {!of_tokens_within}
+   catches it and discards the tables built so far; {!of_tokens} passes
+   a budget of [max_int], which is never exceeded. *)
 exception Over_budget
 
-(* [max_states] caps the states of the result, one integer compare per
-   state discovered. The unbounded form passes [max_int], so the guard
-   compares against it and leaves it alone ([max_int + 1] is
-   negative). *)
+(* [max_states] is the most states the result may have, checked with
+   one integer comparison per new state. {!of_tokens} passes [max_int],
+   so the check compares [!next_id > max_states] and never computes
+   [max_states + 1], which would overflow to a negative number. *)
 let build (token_regexes : (int * Regex.t) list) ~max_states : t =
   let initial_items =
     canonicalise_items
@@ -226,8 +227,9 @@ let of_tokens_within ~max_states token_regexes =
    Moore's partition refinement, over an automaton trimmed of its dead
    states first. States start grouped by [accepts]. Each pass keeps
    two together when their previous block and their outgoing
-   transition signature both match, and passes only split, so the
-   block count climbs until it settles or every state sits alone.
+   transition signature both match. A pass only splits blocks, so the
+   block count increases until a pass leaves it unchanged or every
+   state is in a block of its own.
 
    Construction collapses residuals that agree up to associativity,
    commutativity and idempotence, so the states arriving here are
@@ -240,15 +242,15 @@ let of_tokens_within ~max_states token_regexes =
    has an empty residual language: it accepts nothing, and no path out
    of it reaches anything that does.
 
-   Backward breadth-first from the accepting states. Only the edges
-   leaving a non-accepting state are reversed: a state that accepts
-   something is live from the outset, so nothing is ever discovered
-   through it, and on a lexer's automaton most states accept. The
+   A backward search from the accepting states. Only the edges
+   leaving a non-accepting state are reversed: an accepting state is
+   marked live at the start and never has to be found as a
+   predecessor, and in a lexer's automaton most states accept. The
    reverse edges go into three int arrays -- a counting sort over the
    destinations -- and the frontier into a fourth, so the scan
    allocates four flat arrays and nothing per edge. It runs on every
-   [minimise], including the ones with nothing dead to find, which is
-   what makes both economies worth having. *)
+   [minimise], including those with no dead states, which is why both
+   savings matter. *)
 let live_states (dfa : t) =
   let n = dfa.num_states in
   let live = Array.make n false in
@@ -312,18 +314,18 @@ let live_states (dfa : t) =
    none, which is the common case and not worth copying an automaton
    for.
 
-   This stands in for the completion with a sink that Moore's
-   algorithm is stated over. Refinement reads the transitions as
-   stored, where "no transition on c" and "a transition on c into a
-   dead state" are different signatures for the same behaviour, so
-   with a dead state present it splits states that are equivalent and
-   the dead state and its in-edges survive the pass. Completing with a
-   sink reconciles the two, at the price of a state that has to be
-   split back out again -- a whole extra refinement pass on inputs
-   that would otherwise settle in one. Removing them up front reaches
-   the same partition: every state that remains reaches an accepting
-   state, so no two of them are separated by a difference only a sink
-   could have closed. *)
+   Moore's algorithm is defined on a complete automaton, usually made
+   complete by adding a sink state; trimming replaces that step.
+   Refinement compares transitions as stored, where "no transition on
+   c" and "a transition on c into a dead state" are different
+   signatures for the same behaviour, so with a dead state present it
+   splits equivalent states, and the dead state and its in-edges
+   remain in the result. Adding a sink makes the two signatures equal,
+   but the sink then has to be split off again -- an extra refinement
+   pass on inputs that would otherwise finish in one. Removing dead
+   states first gives the same partition: every remaining state
+   reaches an accepting state, so no two of them differ only in a way
+   a sink would have made equal. *)
 let trim (dfa : t) : t option =
   let n = dfa.num_states in
   if n = 0
@@ -435,7 +437,7 @@ let refine (dfa : t) : t =
       for id = 0 to n - 1 do
         (* Coalesce by destination block, so the signature records
            which inputs reach which block: a state with [{a,d} -> S]
-           signs the same as one with [{a} -> S], [{d} -> S]. Sort,
+           has the same signature as one with [{a} -> S], [{d} -> S]. Sort,
            then union each run in one pass. *)
         let trans =
           let by_block =
@@ -558,24 +560,23 @@ let minimise (dfa : t) : t =
 
 (* -- emission -----------------------------------------------------------------
 
-   What a code generator needs to emit a lexer, where {!transitions}
-   serves a caller inspecting one.
+   Views of the automaton for a code generator emitting a lexer.
 
-   {!transitions} is one entry per block of the state's own partition,
-   which a generator turns into a chain of interval tests. Two views
-   sit better with a generator. A generator with a fast path over part
-   of the codespace emits that chain on both sides of it, though only
-   the arms meeting that part can fire there; {!transitions_in} clips
-   to a range so each chain carries what fires. And a chain per state
-   is a function per state, where the whole automaton usually
-   distinguishes far fewer character classes than it has states (46
-   classes over 1739 states for a lexer with 400 keywords); {!table}
-   is those classes and one array.
+   {!transitions} has one entry per block of the state's own
+   partition, which a generator turns into a chain of interval tests.
+   That has two costs, and each view below removes one. A generator
+   with a fast path over part of the codespace emits the chain on both
+   sides of the split, though only the entries intersecting each part
+   can match there; {!transitions_in} clips to a range so each chain
+   contains only those. And a chain per state is a function per
+   state, while the whole automaton usually distinguishes far fewer
+   character classes than it has states (46 classes over 1739 states
+   for a lexer with 400 keywords); {!table} is those classes and one
+   array.
    -------------------------------------------------------------------------- *)
 
-(* Transitions clipped to [lo .. hi], keeping the arms that meet it. A
-   generator emitting a dispatch per range asks once per range, and
-   emits what fires there. *)
+(* Transitions clipped to [lo .. hi], keeping the entries that
+   intersect it. *)
 let transitions_in t id ~lo ~hi =
   let window = Ucharset.range ~lo ~hi in
   List.filter_map
@@ -593,18 +594,20 @@ type table =
 (* The classes are the coarsest partition of the codespace that every
    state's transitions respect, so a character's class is all the
    automaton needs to know about it. The complement of a state's
-   labels joins the meet as a block of its own, which keeps a
-   character with a transition apart from one without.
+   labels is added to the meet as a block of its own, so a character
+   with a transition from that state is in a different class from one
+   without.
 
-   [next] is filled by representative, one codepoint per class, since
-   a class sits inside one arm or outside them all: class [c] is
-   inside [cs] exactly when [reps.(c)] is. [reps] ascends, so each of
-   an arm's intervals contributes a contiguous run of it, found by
-   binary search — the work is one search per interval plus one
-   write per cell that has a destination. Testing every class against
-   every arm instead costs [arms * classes], which on an automaton
-   whose states share little structure is the whole table for the
-   handful of cells per row that are not [-1]. *)
+   [next] is filled using one representative codepoint per class,
+   since a class lies entirely inside one transition's charset or
+   outside all of them: class [c] is inside [cs] exactly when
+   [reps.(c)] is. [reps] ascends, so each interval of a charset
+   covers a contiguous run of it, found by binary search — the work
+   is one search per interval plus one write per cell that has a
+   destination. Testing every class against every transition would
+   cost [transitions * classes], which on an automaton whose states
+   share little structure is the size of the whole table, to fill
+   the few cells per row that are not [-1]. *)
 let table (t : t) : table =
   let parts = ref [] in
   for id = 0 to t.num_states - 1 do

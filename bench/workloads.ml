@@ -1,6 +1,7 @@
-(* The token sets the benchmarks are measured on, shared so that
-   "the same shapes" means the same shapes. [dfa_bench] builds
-   automata from them; [equiv_bench] decides languages over them. *)
+(* The token sets the benchmarks measure, defined once so every
+   benchmark runs on identical inputs. [dfa_bench] and [emit_bench]
+   build automata from them; [equiv_bench] tests equivalence and
+   emptiness over them. *)
 
 open Redfa
 

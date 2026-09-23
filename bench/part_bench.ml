@@ -1,5 +1,5 @@
-(* Prices [Ucharset.Partition.meet_all] at the shapes
-   [approx_partition] builds it from.
+(* Measures [Ucharset.Partition.meet_all] on the inputs
+   [approx_partition] passes it for an [Alt].
 
    Run: dune exec --profile release bench/part_bench.exe *)
 

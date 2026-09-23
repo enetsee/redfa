@@ -4,20 +4,26 @@
 [![Docs](https://github.com/enetsee/redfa/actions/workflows/docs.yml/badge.svg?branch=main)](https://github.com/enetsee/redfa/actions/workflows/docs.yml)
 
 A regex engine over the Unicode codespace, built on Brzozowski derivatives, with
-the boolean operations alongside the usual ones.
+intersection and complement as well as the usual operations.
 
-Intersection and complement are the point. A derivative-based engine gets them
-for the same price as concatenation, and they are what let you say "an
-identifier that is not a keyword" as one regex and hand it to a DFA.
+Intersection and complement are the main feature. With derivatives they cost
+no more to implement than concatenation, and they let you write "an identifier
+that is not a keyword" as one regex and build a DFA from it.
 
 The engine follows Owens, Reppy and Turon, [*Regular-expression derivatives
-re-examined*][owens09] (Journal of Functional Programming 19(2):173-190, 2009),
-which is where the three things it rests on come from: derivatives give the
-boolean operations for nothing, quotienting terms by associativity,
-commutativity and idempotence keeps the reachable set finite, and taking a
-transition on one representative per *derivative class* rather than per
-character is what makes an alphabet the size of Unicode tractable at all.
-`Ast` is that normal form, and `Dfa`'s partition is those classes.
+re-examined*][owens09] (Journal of Functional Programming 19(2):173-190, 2009).
+Three ideas come from that paper:
+
+- The derivative of an intersection or complement is defined as simply as that
+  of any other operator.
+- Identifying terms that differ only by associativity, commutativity and
+  idempotence makes the set of reachable derivatives finite.
+- Computing one transition per *derivative class* (a set of characters that
+  all give the same derivative) instead of one per character makes an alphabet
+  the size of Unicode practical.
+
+`Ast` implements the normal form from the second point, and `Dfa` partitions the
+alphabet into the classes from the third.
 
 [owens09]: https://doi.org/10.1017/S0956796808007090
 
@@ -57,39 +63,42 @@ let other = Regex.inter ident (Regex.complement keyword)
 let () =
   assert (Ast.eval (Regex.to_ast other) "letter");
   assert (not (Ast.eval (Regex.to_ast other) "let"));
-  (* Decided, not guessed: these two denote the same language. *)
+  (* These two match the same strings, checked exactly. *)
   assert (Regex.equivalent (parse "(ab)*a") (parse "a(ba)*"));
-  (* And this one denotes none at all. *)
+  (* This one matches no string. *)
   assert (Regex.is_empty_language (parse "a.*&b.*"))
 ```
 
 ## What is here
 
-**`Regex`** is the surface: a parser, a printer that round-trips, Oniguruma
-emission, and constructors that keep the shape you wrote. The grammar adds `&`
-for intersection and `~` for complement to the usual syntax.
+**`Regex`** is the syntax users write: a parser, a printer whose output parses
+back to the same term, Oniguruma emission, and constructors that keep the
+structure as written. The grammar adds `&` for intersection and `~` for
+complement to the usual syntax.
 
-**`Ast`** is the hash-consed normal form the engine derives over. It quotients
-associativity, commutativity and idempotence, so equal terms share a node,
-equality is a pointer comparison, and deriving reaches finitely many terms —
-which is what makes the construction below terminate.
+**`Ast`** is the hash-consed normal form the engine takes derivatives of. Terms
+that differ only by associativity, commutativity and idempotence are the same
+node, so equality is a pointer comparison, and a term has finitely many
+derivatives, so DFA construction terminates.
 
 **`Dfa`** builds an automaton from a list of token regexes by item-set
 derivative construction, and minimises it to the Myhill–Nerode minimum. For a
-code generator it also hands over the character classes and the transition
-table, which is usually far smaller than a dispatch per state: a lexer with two
-hundred keywords is 814 states and 34 classes.
+code generator it also provides the character classes and a transition table
+indexed by state and class. This is usually far smaller than a separate
+dispatch per state: a lexer with two hundred keywords has 814 states and 34
+classes.
 
-**Deciding languages.** `equivalent` and `is_empty_language` are exact, over the
-whole codespace and every construct in the type, by Hopcroft–Karp over
-derivatives. So `a*a*` is equivalent to `a*`, and `a & ~a` is recognised as
-empty although the normal form leaves it a live term.
+**Deciding languages.** `equivalent` and `is_empty_language` give exact
+answers, over the whole codespace and every construct in the type, using
+Hopcroft–Karp over derivatives. So `a*a*` is equivalent to `a*`, and
+`a.*&b.*` is empty although its normal form is an intersection of two
+nonempty terms.
 
-**Bounds.** Construction and both decisions are unbounded by nature — a regex
-can denote an automaton larger than the machine. `of_tokens_within`,
-`equivalent_within` and `is_empty_language_within` take a state budget and
-answer `None` rather than running away, which is what to use on a pattern a
-caller did not write.
+**Bounds.** DFA construction and both decisions can take time and memory
+exponential in the size of the regex: `.*a.{20}` has two million states.
+`of_tokens_within`, `equivalent_within` and `is_empty_language_within` take a
+state budget and return `None` when it is exceeded. Use them on patterns from
+untrusted input.
 
 Single-domain: the intern table and the memos on every node are unsynchronised.
 

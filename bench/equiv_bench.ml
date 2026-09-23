@@ -1,24 +1,25 @@
-(* [Ast.equivalent] and [Ast.is_empty_language] against the two
-   alternatives they were chosen over; the same traversal without the
-   union-find, which is the reachable product, and deciding on an
-   automaton from [Dfa.of_tokens].
+(* Compares [Ast.equivalent] and [Ast.is_empty_language] with two
+   alternatives: the same traversal without the union-find, which
+   searches the reachable product automaton, and a check on the
+   automaton built by [Dfa.of_tokens].
 
-   Each workload is the alternation of its tokens against the same
-   alternation with every arm intersected with [.*]: same language,
-   different term at every node.
+   Each workload compares the alternation of its tokens with the same
+   alternation where every arm is intersected with [.*]. The two match
+   the same strings but are different terms at every node.
 
-   One variant per child process. [first_set] and [approx_partition]
-   memoise on the node, so whichever runs first pays for both and the
-   rest read the memos; run in one process, the second comes out two
-   to six times faster than the first, whichever one it is.
+   Each variant runs in its own child process. [first_set] and
+   [approx_partition] store their results on the node, so the first
+   variant computes them and any later variant in the same process
+   reuses them; measured in one process, the second variant runs two
+   to six times faster than the first, in either order.
 
    Run: dune exec --profile release bench/equiv_bench.exe *)
 
 open Redfa
 
-(* Without the union-find, pairs are visited once and remembered,
-   which is a reachability search over the product automaton. Returns
-   the answer and the pairs it expanded. *)
+(* The traversal without the union-find: each pair is recorded in
+   [seen] and expanded once, a reachability search over the product
+   automaton. Returns the result and the number of pairs expanded. *)
 let product_equivalent a b =
   let seen : (int * int, unit) Hashtbl.t = Hashtbl.create 256 in
   let pairs = ref 0 in
@@ -104,10 +105,11 @@ let hk_pairs a b =
   r, !pairs
 ;;
 
-(* Deciding on the automaton instead. Both terms go in as tokens of
-   one DFA, whose states are the pairs of residuals reachable
-   together, so a state accepting one alone is a separating
-   string. *)
+(* Tests equivalence on an automaton. The terms are tokens 0 and 1
+   of one DFA, each state of which is the pair of derivatives of both
+   terms by the same string; the terms differ exactly when some state
+   accepts one token and not the other. Returns the result and the
+   state count. *)
 let dfa_equivalent r1 r2 =
   let d = Dfa.of_tokens [ 0, r1; 1, r2 ] in
   let agree = ref true in
@@ -118,19 +120,22 @@ let dfa_equivalent r1 r2 =
   !agree, Dfa.num_states d
 ;;
 
-(* [(a{p})*a*] is [a*] written as a p-state cycle. Two of them with
-   coprime lengths are the same language through automata that share
-   no state, so the product visits [p * q] pairs where the union-find
-   visits [p + q]. The adversarial shape, against the four realistic
-   ones above. *)
+(* [(a{p})*a*] matches the same strings as [a*], but its derivatives
+   form a cycle of p distinct terms. For two of them with coprime [p]
+   and [q], the two sets of derivatives are disjoint, so the product
+   search visits [p * q] pairs and the union-find [p + q]. This is the
+   worst case for the product search; the four workloads in
+   [Workloads.all] are realistic token sets. *)
 let cycle p =
   let open Regex in
   let a = singleton_char 'a' in
   seq (star (seqs (List.init p (fun _ -> a)))) (star a)
 ;;
 
-(* One regex per workload, and an equivalent term the normal form
-   cannot see through, every arm intersected with [.*]. *)
+(* The two regexes compared for a workload. For a token set, the
+   alternation of its tokens and the same alternation with every arm
+   intersected with [.*], which the normal form keeps as a different
+   term. For [cycles-63x64], two cycles of coprime length. *)
 let pair_of workload =
   if workload = "cycles-63x64"
   then cycle 63, cycle 64
@@ -148,9 +153,9 @@ let clock f =
   (Unix.gettimeofday () -. t0) *. 1000., r
 ;;
 
-(* One variant, in a process of its own; milliseconds, a count of
-   whatever the variant explores, and whether it answered correctly.
-   Counting the pairs happens after the clock stops. *)
+(* Runs one variant and prints milliseconds, the number of pairs or
+   states it explores, and whether its result is correct. For [hk],
+   the pairs are counted by [hk_pairs] after the clock stops. *)
 let measure mode workload =
   let r1, r2 = pair_of workload in
   let ms, count, ok =

@@ -35,8 +35,7 @@ let rec match_star o s =
 (* Four codepoints, so subterms collide constantly and the generated
    terms exercise the dedup and merge paths. The oracle compares bytes,
    so this alphabet has to stay single byte; [meta_alphabet] below is
-   for the tests that check a term against itself rather than a
-   corpus. *)
+   for the tests that use no oracle, such as the round trips. *)
 let alphabet = [| 0x61; 0x62; 0x63; 0x64 |]
 
 (* Every character redfa's own grammar reserves, plus the control and
@@ -72,12 +71,12 @@ let meta_alphabet =
    ; 0xE000 (* just above them *)
    ; 0x10400
      (* supplementary plane, four bytes *)
-     (* A digit reserves nothing in redfa's grammar, which is why this
-        array went without one. It is reserved in Oniguruma's: [{] and
-        [}] only form a repetition around one, so without a digit here
-        an emitter that stopped escaping the braces was invisible to
-        every test. The Oniguruma check below reads a second grammar,
-        so the alphabet has to cover what that one reserves too. *)
+     (* A digit is special only in Oniguruma's grammar: [{] and [}]
+        form a repetition only around digits, as in [a{2}]. Without a
+        digit here, an emitter that stopped escaping braces would pass
+        every test. The Oniguruma check below parses with Oniguruma's
+        grammar, so the alphabet also covers what that grammar
+        reserves. *)
    ; Char.code '2'
   |]
 ;;
@@ -157,10 +156,11 @@ let check name cond =
 
 (* -- what [Ast]'s exported identity means ---------------------------------- *)
 
-(* [tag] is handed out in allocation order and [compare] and [hash] are
-   built from it, so rank is interning order and says nothing about
-   structure. First in the file, so these codepoints are certainly
-   being interned here for the first time. *)
+(* [tag] is assigned in interning order, and [compare] and [hash] are
+   computed from it, so [compare] orders nodes by when they were
+   interned, independently of their structure. This block is first in
+   the file so that these codepoints are interned here for the first
+   time. *)
 let () =
   let first = Ast.singleton 0x2F800 in
   let second = Ast.singleton 0x2F801 in
@@ -168,21 +168,23 @@ let () =
   check "tags ascend with interning order" (Ast.tag first < Ast.tag second);
   check "compare follows the tags" (Ast.compare first second < 0);
   check "hash is the tag" (Ast.hash first = Ast.tag first);
-  (* [third] holds the smallest codepoint and was interned last, so a
-     structural order would rank it first. It does not. *)
+  (* [third] has the smallest codepoint and was interned last, so a
+     structural order would put it first; [compare] puts it last. *)
   check
     "compare is not structural"
     (Ast.compare third first > 0 && Ast.compare third second > 0);
   check
     "compare is zero exactly on equal nodes"
     (Ast.compare first first = 0 && Ast.equal first first && Ast.compare first second <> 0);
-  (* [eps] is the canonical [Seq] of nothing, so both of these are
-     traps for a caller matching on shape. *)
+  (* [eps] is represented as a [Seq] with no children, so [is_seq] is
+     true of it and [seq_children] returns []. A caller that tests
+     [is_seq] before [is_eps] treats [eps] as a sequence. *)
   check "is_seq holds of eps" (Ast.is_seq Ast.eps);
   check "seq_children of eps is the empty list" (Ast.seq_children Ast.eps = []);
   check "is_alt does not hold of eps" (not (Ast.is_alt Ast.eps));
   (* Every constructor taking a raw codepoint validates it through
-     Ucharset, which the .mli now says. *)
+     Ucharset, as the .mli documents, and raises [Invalid_argument] on
+     a surrogate or a value above U+10FFFF. *)
   let raises f =
     match f 0xD800 with
     | () -> false
@@ -207,7 +209,8 @@ let () =
     ; ("one_of ~singles", fun cp -> ignore (one_of ~singles:[ cp ] ()))
     ; ("one_of ~ranges", fun cp -> ignore (one_of ~ranges:[ cp, cp ] ()))
     ];
-  (* The [_char] and [_uchar] forms take scalar values already. *)
+  (* The [_char] and [_uchar] forms take a [char] or a [Uchar.t], which
+     is always a valid scalar value, so they cannot raise. *)
   check "singleton_char cannot raise" (not (is_empty (singleton_char 'a')));
   check
     "singleton_uchar cannot raise"
@@ -245,8 +248,8 @@ let () =
     if Ast.is_seq r
     then (
       let xs = Ast.seq_children r in
-      (* [eps] is the canonical empty [Seq]; anything else has two or
-         more children, the singleton having been unwrapped. *)
+      (* [eps] is the [Seq] with no children; every other [Seq] has two
+         or more, because a one-child [Seq] is replaced by its child. *)
       check "Seq length 0 or >= 2" (xs = [] || List.length xs >= 2);
       check "Seq no eps child" (not (List.exists Ast.is_eps xs));
       check "Seq no empty child" (not (List.exists Ast.is_empty xs)))
@@ -268,14 +271,14 @@ let () =
            (fun t -> check "parsed literal matches only itself" (Ast.eval a t = (t = s)))
            corpus)
     corpus;
-  (* Sources that must be rejected, with the offset the caret lands on. *)
+  (* Sources that must be rejected, with the offset the error reports. *)
   List.iter
     (fun (src, pos) ->
        match of_string src with
        | Ok _ -> check ("of_string should reject " ^ src) false
        | Error e -> check ("of_string " ^ src ^ " reports the right offset") (e.pos = pos))
     [ "a(", 1; "a)b", 1; "[a-", 0; "*a", 0; "[z-a]", 1; "\\q", 0; "[]", 0; "a\\", 1 ];
-  (* Shapes the grammar has to get right. *)
+  (* Sources and the terms they parse to. *)
   let same src t = check ("of_string " ^ src) (of_string src = Ok t) in
   let a = singleton_char 'a'
   and b = singleton_char 'b'
@@ -286,10 +289,9 @@ let () =
   same "a*" (star a);
   same "~a" (complement a);
   same "a&b" (inters [ a; b ]);
-  (* The prefix/postfix interaction the published grammar names. A
-     postfix binds tighter than [~], and [~] takes only the one repeat
-     after it. These pin the .mli's grammar block to the parser: they
-     are the shapes the two used to disagree on. *)
+  (* These check the parser against the grammar in the .mli: a postfix
+     operator binds tighter than [~], and [~] applies to one repeated
+     atom only, so [~ab] is [(~a)b]. *)
   same "~a*" (complement (star a));
   same "~a+" (complement (plus a));
   same "~a?" (complement (opt a));
@@ -297,8 +299,9 @@ let () =
   same "~ab" (seq (complement a) b);
   same "~(ab)" (complement (seq a b));
   same "~~a*" (complement (complement (star a)));
-  (* The reading is observable, not just structural: [a*] matches the
-     empty string, so its complement does not. *)
+  (* The parse determines the language: [~a*] is the complement of
+     [a*], which matches the empty string, so [~a*] does not match it.
+     The starred complement matches it. *)
   let matches src t =
     match of_string src with
     | Error e -> check (Printf.sprintf "of_string %S: %s" src e.msg) false
@@ -316,7 +319,8 @@ let () =
   rejects "~a*" "aa";
   same "[^a]" (not_singleton_char 'a');
   same "." any;
-  (* The class helpers agree with the sources they stand for. *)
+  (* Each class helper builds the same term as the corresponding class
+     source. *)
   same "[abc]" (chars_of_char_list [ 'a'; 'b'; 'c' ]);
   same "[abc]" (chars_of_list [ 0x61; 0x62; 0x63 ]);
   same "[abc]" (chars_of_uchar_list (List.map Uchar.of_int [ 0x61; 0x62; 0x63 ]));
@@ -335,9 +339,9 @@ let () =
 
 (* -- escapes --------------------------------------------------------------- *)
 
-(* Whether a string is well formed UTF-8. An error message goes to a
-   log or a terminal, so one carrying a raw byte out of the source is
-   a defect in its own right. *)
+(* Whether a string is well formed UTF-8. Error messages are printed
+   to logs and terminals, so a message containing an invalid byte
+   copied from the source is a defect. *)
 let is_utf8 s =
   let ok = ref true
   and i = ref 0 in
@@ -367,46 +371,49 @@ let () =
        | Error e -> e.msg = msg
        | Ok _ -> false)
   in
-  (* [int_of_string] reads [_] as a digit separator, so [\u{6_1}] and
-     [\u{61_}] both parsed as [a]. *)
+  (* The escape accepts hex digits only. [int_of_string] accepts [_]
+     as a digit separator, so a parser relying on it reads [\u{6_1}]
+     and [\u{61_}] as [a]. *)
   rejects "\\u{6_1}";
   rejects "\\u{61_}";
   rejects "\\u{_61}";
   rejects "\\u{6 1}";
   rejects "\\u{6+1}";
   rejects "\\u{0x61}";
-  (* Hex digits still parse, either case, leading zeros or not. *)
+  (* Hex digits parse in either case, with or without leading zeros. *)
   parses_as "\\u{61}" (singleton 0x61);
   parses_as "\\u{0061}" (singleton 0x61);
   parses_as "\\u{3bb}" (singleton 0x3BB);
   parses_as "\\u{3BB}" (singleton 0x3BB);
   parses_as "\\u{10FFFF}" (singleton 0x10FFFF);
-  (* Out of range, including a run too long for an int. The fold stops
-     climbing rather than overflowing, so the message names the value
-     rather than blaming the digits. *)
+  (* A value outside the scalar range is rejected with a message
+     naming the value, including a digit run too long for an [int]:
+     the parser stops accumulating once the value is out of range, so
+     it does not overflow. *)
   errors_with "\\u{110000}" "\\u{110000} is not a Unicode scalar value";
   errors_with "\\u{D800}" "\\u{D800} is not a Unicode scalar value";
   errors_with
     "\\u{FFFFFFFFFFFFFFFF}"
     "\\u{FFFFFFFFFFFFFFFF} is not a Unicode scalar value";
-  (* An unknown escape interpolated the byte after the backslash with
-     [%c], so a multi-byte character gave a message that was not
-     valid UTF-8. *)
+  (* The message for an unknown escape quotes the whole character
+     after the backslash. Quoting only its first byte, as [%c] does,
+     gives a message that is invalid UTF-8 when the character is
+     multi-byte. *)
   errors_with "\\\u{E9}" "unknown escape \\\u{E9}";
   errors_with "\\\u{3BB}" "unknown escape \\\u{3BB}";
   errors_with "\\\u{10400}" "unknown escape \\\u{10400}";
   errors_with "\\q" "unknown escape \\q";
-  (* A byte that is not UTF-8 at all is refused as such, and the caret
-     lands on the byte rather than on the backslash. *)
+  (* An invalid UTF-8 byte after a backslash is reported as malformed
+     UTF-8, at the offset of the byte itself. *)
   errors_with "\\\xff" "malformed UTF-8";
   check
     "the caret lands on the malformed byte"
     (match of_string "\\\xff" with
      | Error e -> e.pos = 1
      | Ok _ -> false);
-  (* The property behind those two; every message comes back as valid
-     UTF-8, whatever the source held. Run over every character the round-trip alphabet
-     covers, which is where the multi-byte ones are. *)
+  (* The general property: every error message is valid UTF-8,
+     whatever the source contains. Checked by escaping each character
+     of [meta_alphabet], which includes the multi-byte ones. *)
   let bad = ref 0 in
   Array.iter
     (fun cp ->
@@ -418,11 +425,11 @@ let () =
        | Error e -> if not (is_utf8 e.msg) then incr bad)
     meta_alphabet;
   check "every escape error message is valid UTF-8" (!bad = 0);
-  (* Every ASCII byte, either side of the rule the .mli states; a
-     backslash before a printable non-alphanumeric is that character,
-     and a backslash before space, a C0 control or DEL is an error.
-     The letters and digits are left out, being the named escapes and
-     the errors the block above covers. *)
+  (* The escape rule the .mli states, checked on every ASCII byte: a
+     backslash before a printable non-alphanumeric character matches
+     that character, and a backslash before space, a C0 control or DEL
+     is an error. Letters and digits are skipped; they are the named
+     escapes and the errors covered above. *)
   let escaped cp =
     let b = Buffer.create 4 in
     Buffer.add_char b '\\';
@@ -459,8 +466,9 @@ let () =
        !punct
        !refused)
     (!punct = 32 && !refused = 34);
-  (* And no message carries a control character either, which is the
-     same defect as the raw byte above wearing different clothes. *)
+  (* No error message contains a control character either. Quoting a
+     raw control byte from the source is the same defect as quoting an
+     invalid UTF-8 byte. *)
   let ctrl = ref 0 in
   for cp = 0x00 to 0x7F do
     match of_string (escaped cp) with
@@ -474,18 +482,18 @@ let () =
 
 (* -- source round trips ---------------------------------------------------- *)
 
-(* Equality of the lowered terms, which is what [Regex.equivalent]
-   used to be. The round trips below use it rather than [equivalent],
-   which now decides the language and would accept a printer that
-   rendered [a*] as ["a*a*"]. *)
+(* Equality of the lowered terms. The round trips below use it instead
+   of [equivalent], which compares languages and so would accept a
+   printer that rendered [a*] as ["a*a*"]. *)
 let same_form a b = Ast.equal (to_ast a) (to_ast b)
 
 let round_trips ~alphabet ~seed ~n =
   let st = Random.State.make [| seed |] in
   for _ = 1 to n do
     let r, _ = gen ~alphabet st 3 in
-    (* Rendering and parsing check each other, so a precedence slip on
-       either side shows up here. *)
+    (* Rendering then parsing must give back the same term, so a
+       precedence error in either the printer or the parser fails
+       here. *)
     let src = to_string r in
     (match of_string src with
      | Error e ->
@@ -493,8 +501,9 @@ let round_trips ~alphabet ~seed ~n =
          (Printf.sprintf "to_string produced unparseable source %S: %s" src e.msg)
          false
      | Ok back -> check (Printf.sprintf "round trip %S" src) (same_form r back));
-    (* Oniguruma output is a subset of the same syntax, once [(?:] is
-       read as a group. *)
+    (* Oniguruma output is also valid redfa source, since redfa's
+       parser reads [(?:] as a group, so it round trips the same
+       way. *)
     match to_oniguruma r with
     | Error _ -> ()
     | Ok oni ->
@@ -507,15 +516,15 @@ let round_trips ~alphabet ~seed ~n =
 
 let () =
   round_trips ~alphabet ~seed:7 ~n:4000;
-  (* The same round trip over every character the grammar reserves. An
-     escape the emitter forgets makes the output reparse as an operator,
-     which no alphabet of plain letters can show. *)
+  (* The same round trip over every character the grammar reserves. A
+     missing escape makes a literal reparse as an operator, which an
+     alphabet of plain letters cannot detect. *)
   round_trips ~alphabet:meta_alphabet ~seed:1109 ~n:4000
 ;;
 
-(* The reserved characters, one at a time, as literals. [&] is the case
-   that used to come back silently as the empty language rather than as
-   an error. *)
+(* Each reserved character as a single literal, through [to_oniguruma]
+   and back. The defect this guards against: a literal [&] came back as
+   the empty language and no error was reported. *)
 let () =
   Array.iter
     (fun cp ->
@@ -609,20 +618,20 @@ let () =
 
 (* -- the Oniguruma output against Oniguruma --------------------------------
 
-   The round trips above read [to_oniguruma]'s output back with redfa's
-   own parser. That shows redfa can read what it wrote; it cannot show
-   that Oniguruma reads it as the same language, which is the thing the
-   emitter exists to get right. The two grammars disagreeing is exactly
-   what an escaping slip looks like -- the [&] and [~] defect reparsed
-   cleanly here while denoting something else there.
+   The round trips above parse [to_oniguruma]'s output with redfa's own
+   parser. That checks that redfa reads its output back as the same
+   term; it does not check that Oniguruma reads it as the same
+   language, which is what the emitter is for. An escaping error
+   usually shows up as exactly that difference: the [&] and [~] defect
+   parsed cleanly in redfa and meant something else in Oniguruma.
 
-   Ruby's engine is Onigmo, an Oniguruma fork, so it stands in. Each
-   term crosses as its emitted source and one witness string, both hex
-   encoded so no shell or encoding layer can touch the bytes. Ruby
-   anchors with \A(?:...)\z, [eval] being a whole-string match, and
-   reports every disagreement. Skipped, loudly, where there is no ruby
-   to run: a silent skip is a test that stops testing without saying
-   so. *)
+   The check runs Ruby, whose regex engine, Onigmo, is a fork of
+   Oniguruma. Each row sends the emitted source and one witness string,
+   both hex encoded so the shell and encoding layers pass the bytes
+   through unchanged. The script anchors the pattern as \A(?:...)\z,
+   since [eval] matches whole strings, and prints every disagreement.
+   When there is no ruby on the PATH the check is skipped and prints a
+   SKIPPED line, so the missing coverage is visible. *)
 
 let utf_8_of_cp cp =
   let b = Buffer.create 4 in
@@ -636,9 +645,9 @@ let hex s =
   Buffer.contents b
 ;;
 
-(* Strings over [meta_alphabet]: every one of length 0 and 1, and a
-   sample of the pairs, which is where an escape that only misfires
-   next to another character shows up. *)
+(* Strings over [meta_alphabet]: every one of length 0 and 1, and 60
+   random pairs, to catch an escape that fails only next to another
+   character. *)
 let meta_corpus =
   let st = Random.State.make [| 4242 |] in
   let singles = Array.to_list (Array.map utf_8_of_cp meta_alphabet) in
@@ -676,7 +685,7 @@ puts "TOTAL #{total} #{fails}"
 let have_ruby = Sys.command "ruby -e '' >/dev/null 2>&1" = 0
 
 (* One line per (term, witness): the emitted source, the witness, and
-   what [eval] answers for the term the source was emitted from. *)
+   what [eval] returns for the term the source was emitted from. *)
 let onig_rows ~alphabet ~witnesses ~seed ~n =
   let st = Random.State.make [| seed |] in
   let rows = Buffer.create (1 lsl 16) in
@@ -684,8 +693,9 @@ let onig_rows ~alphabet ~witnesses ~seed ~n =
   for _ = 1 to n do
     let r, _ = gen ~alphabet st 3 in
     match to_oniguruma r with
-    (* Complement, a non-charset intersection and the empty language
-       have no Oniguruma form; the emitter says so and means it. *)
+    (* Complement, an intersection that is not a character class, and
+       the empty language have no Oniguruma form; [to_oniguruma]
+       returns [Error] for them. *)
     | Error _ -> ()
     | Ok oni ->
       incr terms;
@@ -749,20 +759,22 @@ let run_onig ~label ~rows =
   | _ -> check (Printf.sprintf "%s: ruby produced no TOTAL line" label) false
 ;;
 
-(* The constructs Oniguruma reserves and redfa does not, as literal
-   text that has to survive emission meaning itself. Leaving these to
-   the generator is a coin flip -- [{2}] needs three specific
-   codepoints adjacent and in order -- so they are named. Each goes
-   over twice: as a [str], where the danger is outside a class, and as
-   the set of its characters, where [\[:] would open a POSIX bracket. *)
+(* Constructs Oniguruma has and redfa lacks (repetition counts, POSIX
+   brackets, anchors, [\d]), written as literal text that must still
+   match itself after emission. The generator rarely produces them
+   ([{2}] needs three specific codepoints adjacent and in order), so
+   they are listed here. Each is tested twice: as a [str], which checks
+   escaping outside a class, and as the class of its characters, which
+   checks escaping inside one, where [\[:] would open a POSIX
+   bracket. *)
 let onig_adversarial_rows () =
   let literals =
-    [ "a{2}" (* a repetition, if the braces go out bare *)
+    [ "a{2}" (* a repetition, if the braces are emitted unescaped *)
     ; "{2}"
     ; "a{2,3}"
     ; "a{,3}"
-    ; "[:alpha:]" (* a POSIX bracket, if [ and : go out bare *)
-    ; "^abc$" (* anchors, if ^ and $ go out bare *)
+    ; "[:alpha:]" (* a POSIX bracket, if [ and : are emitted unescaped *)
+    ; "^abc$" (* anchors, if ^ and $ are emitted unescaped *)
     ; "a.b"
     ; "a|b"
     ; "(?:a)"
@@ -823,8 +835,9 @@ let () =
 (* -- the printers over the whole public type ------------------------------- *)
 
 (* [=] on a [Regex.t] compares the [Ucharset.t] payloads structurally.
-   Set equality is what is wanted here, so go through [Ucharset.equal]
-   rather than trusting the two to agree. *)
+   This comparison needs set equality, so it compares charsets with
+   [Ucharset.equal], which is correct even if one set could have two
+   representations. *)
 let rec same_regex a b =
   match a, b with
   | Chars x, Chars y | Neg_chars x, Neg_chars y -> Ucharset.equal x y
@@ -836,8 +849,9 @@ let rec same_regex a b =
   | _ -> false
 ;;
 
-(* [pp] breaks at the formatter's margin, so widen it: this compares
-   renderings, not layouts. *)
+(* [pp] inserts line breaks at the formatter's margin. The margin is
+   set very wide so that renderings are compared without line
+   breaks. *)
 let pp_string t =
   let buf = Buffer.create 64 in
   let ppf = Format.formatter_of_buffer buf in
@@ -847,13 +861,12 @@ let pp_string t =
   Buffer.contents buf
 ;;
 
-(* [pp] is a debug view, so its one job is to say which node you are
-   holding. That is injectivity: two terms sharing a rendering means
-   the rendering does not identify either. Both of the review's cases
-   are collisions of exactly that shape --- [Neg_chars c] against
-   [Complement (Chars c)], and [Star (Neg_chars c)] against
-   [Complement (Star (Chars c))], the second because the prefix [~] was
-   printed at atom precedence and so was never parenthesised. *)
+(* [pp] is a debug view, so distinct terms must print differently: a
+   rendering shared by two terms identifies neither. The review found
+   two such collisions: [Neg_chars c] against [Complement (Chars c)],
+   and [Star (Neg_chars c)] against [Complement (Star (Chars c))], the
+   second because prefix [~] was printed at atom precedence and so was
+   not parenthesised. *)
 let pp_injective ~alphabet ~seed ~n =
   let st = Random.State.make [| seed |] in
   let seen = Hashtbl.create 4096 in
@@ -889,8 +902,8 @@ let () =
   check
     "pp parenthesises a starred negated class"
     (pp_string (Star (Neg_chars a)) <> pp_string (Complement (Star (Chars a))));
-  (* Empty [Alt] and empty [Inter] printed as nothing, which is what a
-     [Seq] of nothing prints and is the language of [eps], not theirs. *)
+  (* [Alt []], [Inter []] and [Seq []] must print differently: they
+     are the empty language, every string, and [eps]. *)
   check "pp tells the empty language from eps" (pp_string (Alt []) <> pp_string Eps);
   check
     "pp tells the empty language from an empty Seq"
@@ -899,11 +912,11 @@ let () =
   check "pp tells the two empty lists apart" (pp_string (Alt []) <> pp_string (Inter []))
 ;;
 
-(* [to_string] is documented as the source [of_string] reads back, and
-   the constructors are public, so it has to be total over the type.
-   [Alt \[\]] is the empty language and [Inter \[\]] is every string;
-   both used to render as the empty source, which reads back as
-   [eps]. *)
+(* [to_string] is documented to produce source that [of_string] reads
+   back, and the constructors are public, so this must hold for every
+   value of the type, including the empty lists. [Alt \[\]] is the
+   empty language and [Inter \[\]] is every string; rendering either as
+   the empty source would read back as [eps]. *)
 let () =
   let a = Chars (Ucharset.singleton_char 'a') in
   let reads_back name t =
@@ -927,8 +940,8 @@ let () =
     ; "Inter [Inter []; a]", Inter [ Inter []; a ]
     ; "Alt [Alt []; a]", Alt [ Alt []; a ]
     ];
-  (* [same_form] would be satisfied by any two terms that agree, so
-     pin the languages the two empty lists denote as well. *)
+  (* [same_form] only checks that the term survives the round trip, so
+     also check the languages of the two empty lists directly. *)
   check "Alt [] is the empty language" (not (Ast.eval (to_ast (Alt [])) ""));
   check "Alt [] matches nothing at all" (not (Ast.eval (to_ast (Alt [])) "a"));
   check "Inter [] takes the empty string" (Ast.eval (to_ast (Inter [])) "");
@@ -937,9 +950,9 @@ let () =
 
 (* -- str rejects the bytes of_string rejects ------------------------------- *)
 
-(* [String.get_utf_8_uchar] answers U+FFFD on a bad byte instead of
-   failing, so [str] used to build a term the caller did not write,
-   silently, over input the parser refuses. *)
+(* [String.get_utf_8_uchar] returns U+FFFD for an invalid byte without
+   failing, so [str] has to check validity itself. Otherwise it builds
+   a term for U+FFFD, with no error, from input [of_string] rejects. *)
 let () =
   List.iter
     (fun s ->
@@ -958,9 +971,7 @@ let () =
          (match Ast.str s with
           | exception Invalid_argument _ -> true
           | _ -> false);
-       (* Matching is the other half of the same contract: the bytes
-          [str] refuses to build a term from are the bytes [eval]
-          refuses to match one against. *)
+       (* [eval] raises on exactly the inputs [str] rejects. *)
        check
          (Printf.sprintf "Ast.eval rejects %S" s)
          (match Ast.eval Ast.any s with
@@ -973,8 +984,7 @@ let () =
     ; "\xed\xa0\x80" (* a surrogate, ill formed in UTF-8 *)
     ; "\xf4\x90\x80\x80" (* above U+10FFFF *)
     ];
-  (* Only the malformed input is refused. A well formed U+FFFD is a
-     codepoint like any other and still goes through. *)
+  (* A well formed U+FFFD is an ordinary codepoint and is accepted. *)
   let fffd = "\xef\xbf\xbd" in
   check "Regex.str keeps a real U+FFFD" (Ast.eval (to_ast (str fffd)) fffd);
   check "Ast.str keeps a real U+FFFD" (Ast.eval (Ast.str fffd) fffd);
@@ -983,8 +993,9 @@ let () =
     (Ast.eval (to_ast (str "\xce\xbbx")) "\xce\xbbx");
   check "Ast.str still takes valid text" (Ast.eval (Ast.str "\xce\xbbx") "\xce\xbbx");
   check "str of the empty string is eps" (is_eps (str ""));
-  (* The defect itself: every byte that cannot stand alone decoded to
-     U+FFFD, so a regex for U+FFFD took all 128 of them. *)
+  (* The defect itself: each byte from 0x80 to 0xFF is invalid on its
+     own and decodes to U+FFFD, so a regex for U+FFFD matched all 128
+     of them. *)
   let r_fffd = Ast.str fffd in
   let taken =
     List.filter
@@ -997,10 +1008,10 @@ let () =
   check
     (Printf.sprintf "no lone bad byte matches U+FFFD (%d of 128 did)" (List.length taken))
     (taken = []);
-  (* And the answer is a property of the string, not of the term it
-     meets. [eval] gives up as soon as the residual dies, so a check
-     made during the fold would let [empty] and a short-circuiting
-     [Seq] through while [any] raised. *)
+  (* [eval] raises on invalid UTF-8 whatever the term. It stops as soon
+     as the derivative is [empty], so validating the string while
+     matching would miss the bad byte for [empty], or for a [Seq] that
+     fails before reaching it, and raise only for terms like [any]. *)
   List.iter
     (fun (name, r) ->
        check
@@ -1018,13 +1029,13 @@ let () =
 
 (* -- the first-set guard never rejects a live codepoint --------------------- *)
 
-(* [deriv] answers [empty] for every codepoint outside [first_set], so an
-   under-approximation there — or bounds that disagree with the set they
-   summarise — is a wrong answer with no error attached. The oracle
-   shares no code with the engine, so this pins the guard from outside:
-   every string the oracle matches has to begin with a codepoint the
-   first set admits, and the derivative on that codepoint has to be
-   live. *)
+(* [deriv] returns [empty] for every codepoint outside [first_set], so
+   a [first_set] that is too small, or bounds that disagree with the
+   set they summarise, give a wrong result with no error. This checks
+   it against the oracle, which shares no code with the engine: every
+   string the oracle matches must begin with a codepoint in
+   [first_set], and the derivative on that codepoint must not be
+   [empty]. *)
 let () =
   let st = Random.State.make [| 8675309 |] in
   for _ = 1 to 2000 do
@@ -1048,16 +1059,15 @@ let () =
 
 (* -- the approximate partition's defining property -------------------------- *)
 
-(* Two codepoints in one block derive the term to the identical node.
-   The whole DFA construction reduces to this; [of_tokens] derives on
-   one representative per block and lets the result stand for every
-   codepoint in it, so a block that is too coarse gives a wrong
-   automaton silently. It was fuzzed when the review found it and
-   never became a test.
+(* Any two codepoints in one block give the same derivative node. The
+   DFA construction depends on this: [of_tokens] derives on one
+   representative per block and uses the result for every codepoint in
+   the block, so a block that is too coarse gives a wrong automaton
+   with no error.
 
-   A block runs to millions of codepoints, so the probes are the two
-   endpoints of each of its intervals, where a boundary error shows,
-   plus members drawn at random. *)
+   A block can contain millions of codepoints, so it is probed at both
+   endpoints of each of its intervals, where boundary errors show, and
+   at random members. *)
 
 let interval_endpoints cs =
   let acc = ref [] in
@@ -1065,8 +1075,9 @@ let interval_endpoints cs =
   !acc
 ;;
 
-(* A member of [cs] at random; an interval at random, then a point
-   inside it. Indexing the set itself would cost its cardinal. *)
+(* A random member of [cs]: a random interval, then a random point
+   inside it. Picking the n-th member of the set would take time
+   proportional to its cardinal. *)
 let random_member st cs =
   let ivals = Array.of_list (Ucharset.to_intervals cs) in
   let lo, hi = ivals.(Random.State.int st (Array.length ivals)) in
@@ -1107,8 +1118,8 @@ let check_partition ~label ~alphabet ~seed ~trials ~depth =
     check
       (name "the blocks cover the codespace")
       (Ucharset.equal (Ucharset.union_list (Array.to_list blocks)) Ucharset.all);
-    (* Covering, and cardinals summing to the codespace, is
-       disjointness without the quadratic check. *)
+    (* Blocks that cover the codespace and whose cardinals sum to its
+       size are disjoint, which avoids checking every pair. *)
     check
       (name "the blocks are disjoint")
       (Array.fold_left (fun acc b -> acc + Ucharset.cardinal b) 0 blocks = all_cardinal);
@@ -1119,9 +1130,9 @@ let check_partition ~label ~alphabet ~seed ~trials ~depth =
            (Ucharset.min_elt_opt b = Some reps.(i)))
       blocks;
     uniform_on a blocks reps;
-    (* What [Dfa.of_tokens] actually derives on, the meet of several
-       terms' partitions, where every term has to be uniform on every
-       block of the common refinement. *)
+    (* [Dfa.of_tokens] derives on the blocks of the meet of several
+       terms' partitions, so every term must also give one derivative
+       per block of the meet. *)
     let others = List.init 2 (fun _ -> to_ast (fst (gen ~alphabet st depth))) in
     let terms = a :: others in
     let joint = Ucharset.Partition.meet_all (List.map Ast.approx_partition terms) in
@@ -1161,7 +1172,8 @@ let () =
   check "str is not byte oriented" (not (matches (str (lam ^ "x")) "x"));
   check "any is one codepoint" (matches any lam);
   check "any is not one byte" (not (matches (seq any any) lam));
-  (* Escapes and classes carry codepoints, not bytes. *)
+  (* Escapes and classes denote codepoints: [\u{3BB}] and [[^\u{3BB}]]
+     each match or exclude the two-byte character as a unit. *)
   (match of_string "\\u{3BB}" with
    | Error _ -> check "parse \\u{3BB}" false
    | Ok r ->
@@ -1184,18 +1196,16 @@ let () =
 
 module Dfa = Redfa.Dfa
 
-(* A DFA alphabet that leaves the BMP. The oracle in [gen] compares
-   bytes, so it cannot run this; everything below compares the
-   automaton against [Ast.eval] on the same term instead, which is the
-   reference the DFA tests have always used. The surrogate boundaries
-   and a supplementary-plane codepoint are here because the DFA path
-   had never been driven outside the BMP: [dfa_accepts] used to index
-   bytes. *)
+(* A DFA alphabet of multi-byte codepoints, including the surrogate
+   boundaries and one outside the BMP. The oracle in [gen] compares
+   bytes and cannot handle these, so the DFA tests below compare the
+   automaton against [Ast.eval] on the same term. This alphabet checks
+   that the DFA path works on codepoints beyond ASCII and the BMP. *)
 let wide_alphabet = [| 0x00; Char.code '~'; 0x3BB; 0xD7FF; 0xE000; 0x10400 |]
 
-(* Every string of up to [len] codepoints over [alphabet], as
-   codepoint lists. Strings, being UTF-8, are not what the automaton
-   consumes. *)
+(* Every string of up to [len] codepoints over [alphabet], as codepoint
+   lists, since the automaton consumes codepoints and a string is UTF-8
+   bytes. *)
 let cp_corpus ~alphabet ~len =
   let rec grow acc k =
     if k = 0
@@ -1217,10 +1227,11 @@ let utf8 cps =
   Buffer.contents b
 ;;
 
-(* Traverse the DFA over a codepoint sequence, returning the accepts
-   list at the state it lands in, or [] if it gets stuck. Stuck means
-   every item's derivative died, so no token can match, matching the
-   empty accepts list the reference gives. *)
+(* Run the DFA on a codepoint sequence and return the accepts list of
+   the final state, or [] if some codepoint has no transition. A
+   missing transition means every token's derivative is empty, so no
+   token matches, which agrees with the empty list the reference
+   gives. *)
 let dfa_accepts dfa cps =
   let rec go id = function
     | [] -> Dfa.accepts dfa id
@@ -1264,8 +1275,9 @@ let same_dfa a b =
    codepoints, rather than charset signatures).
 
    Two codepoints in one block of the common refinement of every
-   state's transition labels behave alike from every state, so one
-   representative per block is a faithful finite alphabet. *)
+   state's transition labels have the same transition from every
+   state, so one representative per block is enough as a finite
+   alphabet. *)
 let effective_alphabet (d : Dfa.t) =
   let parts = ref [] in
   Dfa.iter_states d (fun id ->
@@ -1347,10 +1359,11 @@ let reference_min (d : Dfa.t) =
   }
 ;;
 
-(* Which state of [m] stands for each state of [d]. Every state of [d]
-   is reachable, so walking the two together from their initial states
-   reaches all of them; [-1] marks one [minimise] dropped, which it
-   may do only for a state with an empty residual language. *)
+(* For each state of [d], the state of [m] it corresponds to. Every
+   state of [d] is reachable, so walking both automata in step from
+   their initial states visits all of them. [-1] marks a state that
+   [minimise] removed, which is allowed only for a state with an empty
+   residual language. *)
 let correspondence (d : Dfa.t) (m : Dfa.t) =
   let map = Array.make (Dfa.num_states d) (-1) in
   let rec walk o s =
@@ -1375,10 +1388,10 @@ let correspondence (d : Dfa.t) (m : Dfa.t) =
 
 (* -- the properties -------------------------------------------------------- *)
 
-(* Case ids some reachable state accepts, which is what [reaches] would
-   name if it were exact. A fixpoint over the transition graph, an
-   unrelated computation to the item-set projection [reaches] comes
-   from. *)
+(* For each state, the case ids accepted by some state reachable from
+   it: the exact set that [reaches] over-approximates. Computed as a
+   fixpoint over the transition graph, independently of the item sets
+   [reaches] is computed from. *)
 let matchable (d : Dfa.t) =
   let n = Dfa.num_states d in
   let out = Array.make n [] in
@@ -1429,26 +1442,28 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
          check (name "dfa accepts") (dfa_accepts dfa cps = expected);
          check (name "minimised dfa accepts") (dfa_accepts mini cps = expected))
       corp;
-    (* The size, against a reference Myhill-Nerode minimisation. The
-       refinement used to sign a state by its stored transitions, which
-       tells "no transition on c" apart from "a transition on c into a
-       dead state", so dead states and their in-edges survived: about
-       one random rule set in ten came out above the minimum. *)
+    (* The size, against the reference Myhill-Nerode minimisation. This
+       guards against a refinement that computes each state's signature
+       from its stored transitions: that treats "no transition on c" and "a transition
+       on c into a dead state" as different, so dead states and the
+       edges into them are kept, and about one random rule set in ten
+       minimises to more states than the minimum. *)
     let reference = reference_min dfa in
     check
       (name "minimise reaches the minimum")
       (Dfa.num_states mini = reference.min_states);
     check (name "minimise is idempotent") (same_dfa mini (Dfa.minimise mini));
-    (* Nothing dead survives, the one exception being the automaton
-       that is nothing but a dead state. *)
+    (* No dead state remains after [minimise], except when the whole
+       automaton is a single dead state (the empty language). *)
     let dead_survivors = ref 0 in
     Dfa.iter_states mini (fun id -> if Dfa.is_dead mini id then incr dead_survivors);
     check
       (name "no dead state survives")
       (!dead_survivors = 0 || (Dfa.num_states mini = 1 && reference.dead.(0)));
-    (* What both automata owe their callers. [minimise] rebuilds every
-       transition list, dropping the edges into dead states, so it has
-       to be held to the same promises the construction is. *)
+    (* Invariants both automata must satisfy. [minimise] rebuilds every
+       transition list, removing the edges into dead states, so its
+       output is checked against the same invariants as
+       [of_tokens]'s. *)
     let well_formed what a =
       Dfa.iter_states a (fun id ->
         let acc = Dfa.accepts a id
@@ -1466,8 +1481,8 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
           (name (what ^ " is_dead agrees with accepts and transitions"))
           (Dfa.is_dead a id = (acc = [] && Dfa.transitions a id = []));
         (* Transitions out of a state are pairwise disjoint, which is
-           what makes the traversal above deterministic, and they
-           arrive in ascending order of least codepoint. *)
+           what makes the traversal above deterministic, and they are
+           listed in ascending order of least codepoint. *)
         let css = List.map fst (Dfa.transitions a id) in
         let rec disjoint = function
           | [] | [ _ ] -> true
@@ -1482,10 +1497,12 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
         let mins = List.filter_map Ucharset.min_elt_opt css in
         check (name (what ^ " labels ascending")) (mins = List.sort Int.compare mins))
     in
-    (* [reaches] is documented as an over-approximation of what can
-       still match, and as one that survives [minimise]. Both halves
-       are pinned; it covers what is matchable, and on some states it
-       runs longer, on each automaton. *)
+    (* [reaches] is documented as an over-approximation of the cases
+       that can still match, before and after [minimise]. On each
+       automaton this checks that it contains every matchable case, and
+       counts the states where it has extra entries; the check after
+       the loop requires some, so the over-approximation is
+       exercised. *)
     List.iter
       (fun (what, a, counter) ->
          let m = matchable a in
@@ -1498,9 +1515,10 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
       [ "built", dfa, over_built; "minimised", mini, over_min ];
     well_formed "built" dfa;
     well_formed "minimised" mini;
-    (* [reaches] at a merged state is the union of those merged: the
-       documented claim, checked against the correspondence between
-       the two automata rather than assumed. *)
+    (* As documented, [reaches] at a merged state is the union of
+       [reaches] over the states merged into it. Which states were
+       merged is computed from the correspondence between the two
+       automata. *)
     if reference.dead.(0)
     then (
       check (name "an empty language minimises to one state") (Dfa.num_states mini = 1);
@@ -1538,8 +1556,8 @@ let check_dfa ~label ~alphabet ~len ~seed ~trials ~depth ~max_tokens =
 ;;
 
 let () =
-  (* The single-byte alphabet the suite has always used, over every
-     string of up to three characters. *)
+  (* The four-letter single-byte alphabet, over every string of up to
+     three characters. *)
   check_dfa ~label:"ascii" ~alphabet ~len:3 ~seed:99 ~trials:400 ~depth:3 ~max_tokens:4;
   check_dfa
     ~label:"ascii deep"
@@ -1560,12 +1578,12 @@ let () =
     ~max_tokens:3
 ;;
 
-(* The review's own reproduction. In "a(b.*&c.*)" the parenthesised
-   half is the empty language said in a way the normal form does not
-   notice, so deriving [a] leaves a state that accepts nothing and
-   goes nowhere. It used to survive minimisation, along with the edge
-   into it. (The regex is quoted because a comment cannot hold a bare
-   "*" followed by ")".) *)
+(* The review's reproduction. In "a(b.*&c.*)" the parenthesised part
+   is the empty language, but the normal form keeps it as an
+   intersection, so deriving by [a] reaches a state that accepts
+   nothing and has no transitions. [minimise] must remove that state
+   and the edge into it. (The regex is quoted because a comment cannot
+   contain a bare "*" followed by ")".) *)
 let () =
   let d =
     Dfa.of_tokens
@@ -1586,8 +1604,8 @@ let () =
     (List.map (fun (cs, dst) -> Ucharset.to_intervals cs, dst) (Dfa.transitions m 0)
      = [ [ Char.code 'd', Char.code 'd' ], 1 ]);
   check "and the survivor is the one that accepts" (Dfa.accepts m 1 = [ 1 ]);
-  (* A whole language that is empty keeps its one state, since an
-     automaton has to have an initial one. *)
+  (* An empty language minimises to one dead state, since an automaton
+     needs an initial state. *)
   let e =
     Dfa.minimise
       (Dfa.of_tokens [ 0, inter (singleton_char 'a') (complement (singleton_char 'a')) ])
@@ -1597,11 +1615,11 @@ let () =
 
 (* -- deciding a language --------------------------------------------------- *)
 
-(* The same decision, taken on the automaton. Both terms go in as
-   tokens of one DFA, whose states are the pairs of residuals reached
-   together, so a state accepting one alone is a separating string. It
-   shares [deriv] with [Ast.equivalent], as everything here does, and
-   decides in an unrelated way. *)
+(* Equivalence computed on the automaton. Both terms are tokens of one
+   DFA, whose states are pairs of derivatives by the same string,
+   so a state accepting exactly one of the two tokens means some string
+   separates them. It uses [deriv], as [Ast.equivalent] does, but
+   decides by a different algorithm. *)
 let dfa_equivalent r1 r2 =
   let d = Dfa.of_tokens [ 0, r1; 1, r2 ] in
   let agree = ref true in
@@ -1612,18 +1630,19 @@ let dfa_equivalent r1 r2 =
   !agree
 ;;
 
-(* Emptiness, likewise. [minimise] is documented to leave the empty
-   language as one dead state, and no dead state otherwise. *)
+(* Emptiness computed on the automaton. [minimise] is documented to
+   return a single dead state for the empty language, and no dead state
+   otherwise. *)
 let dfa_empty_language r =
   let m = Dfa.minimise (Dfa.of_tokens [ 0, r ]) in
   Dfa.num_states m = 1 && Dfa.is_dead m 0
 ;;
 
-(* Rewritings that change the term and keep the language. Each is an
-   identity over the boolean operations, past the reach of flattening,
-   sorting and dropping duplicates, so [Ast.equal] reads
-   [(r&x) | (r&~x)] and [r] as separate terms. [x] is a second random
-   term, so the two sides have differently shaped automata. *)
+(* Rewritings that change the term but keep the language. Each is a
+   boolean identity that flattening, sorting and deduplication do not
+   simplify, so, for example, [(r&x) | (r&~x)] and [r] are different
+   terms under [Ast.equal]. [x] is a second random term, so the two
+   sides have differently shaped automata. *)
 let rewrite st r x =
   match Random.State.int st 5 with
   (* r & (every string) *)
@@ -1638,17 +1657,17 @@ let rewrite st r x =
   | _ -> alt r (inter r x)
 ;;
 
-(* Random pairs, against the reference decision on the automaton and
-   against the corpus. [len] and [alphabet] fix the corpus; a corpus
-   disagreement is a witness string, so it settles the answer on its
-   own, and it is the check that shares its decision procedure with
-   nothing here. *)
+(* Random pairs, checked against the decision on the automaton and
+   against the corpus. [len] and [alphabet] define the corpus. A corpus
+   string matched by one term and not the other proves the terms
+   differ, and that check uses neither decision procedure. *)
 let check_equivalence ~label ~alphabet ~len ~seed ~trials ~depth =
   let st = Random.State.make [| seed |] in
   let corp = List.map utf8 (cp_corpus ~alphabet ~len) in
   let name what = Printf.sprintf "%s: %s" label what in
-  (* Non-vacuity, how many rewritten pairs the normal form still sees
-     as different terms, and how many random pairs land either way. *)
+  (* Counts that show the checks are not vacuous: rewritten pairs that
+     are still different terms after normalisation, and random pairs
+     found equivalent and not equivalent. *)
   let rewritten_distinct = ref 0
   and random_same = ref 0
   and random_differ = ref 0 in
@@ -1658,7 +1677,8 @@ let check_equivalence ~label ~alphabet ~len ~seed ~trials ~depth =
     let s, _ = gen ~alphabet st depth in
     let ar = to_ast r
     and as_ = to_ast s in
-    (* An identity the normal form cannot see. *)
+    (* A language-preserving rewrite that normalisation does not
+       undo. *)
     let r' = rewrite st r x in
     if not (same_form r r') then incr rewritten_distinct;
     check (name "a rewriting that preserves the language is equivalent") (equivalent r r');
@@ -1669,12 +1689,14 @@ let check_equivalence ~label ~alphabet ~len ~seed ~trials ~depth =
     check (name "equivalent agrees with the automaton") (got = dfa_equivalent r s);
     check (name "equivalent is symmetric") (got = equivalent s r);
     check (name "equivalent is reflexive") (equivalent r r);
-    (* A witness in the corpus settles it without any automaton. *)
+    (* A corpus string that separates the terms proves them not
+       equivalent. *)
     let witness = List.exists (fun w -> Ast.eval ar w <> Ast.eval as_ w) corp in
     if witness then check (name "a witness string means not equivalent") (not got);
     if got
     then check (name "equivalent terms agree on every string of the corpus") (not witness);
-    (* Emptiness, the same three ways. *)
+    (* Emptiness, checked against the automaton, [equivalent] and the
+       corpus. *)
     let empty_r = is_empty_language r in
     check
       (name "is_empty_language agrees with the automaton")
@@ -1717,7 +1739,8 @@ let () =
     ~trials:200
     ~depth:5;
   (* Outside the BMP and across the surrogate boundaries, where the
-     two terms' partitions are refined together rather than shared. *)
+     two terms have different partitions and the check has to refine
+     them together. *)
   check_equivalence
     ~label:"equiv wide"
     ~alphabet:wide_alphabet
@@ -1727,10 +1750,10 @@ let () =
     ~depth:3
 ;;
 
-(* The review's own examples, and the two questions the type could not
-   answer before. Each names the structural test as well, so a
-   rewriting of [equivalent] back into [same_form] fails here rather
-   than passing quietly. *)
+(* The review's examples, plus fixed cases of equivalence and
+   emptiness. Where the two sources lower to different terms, the check
+   also asserts that, so an [equivalent] that only compared terms
+   structurally would fail here. *)
 let () =
   let p src =
     match of_string src with
@@ -1744,8 +1767,8 @@ let () =
       (Printf.sprintf "%S is equivalent to %S" src1 src2)
       (equivalent a b && equivalent b a)
   in
-  (* The same, where the normal form does not already see it, so the
-     check cannot pass by lowering the two to one node. *)
+  (* The same, for sources that lower to different terms, so the check
+     cannot pass by structural equality. *)
   let equiv_beyond_aci src1 src2 =
     equiv src1 src2;
     check
@@ -1804,14 +1827,15 @@ let () =
          (Printf.sprintf "%S is not the empty language" src)
          (not (is_empty_language (p src))))
     [ "a"; ""; "~a"; "a*"; "a|b"; "~(a&~a)"; ".*" ];
-  (* Structurally empty, the one case that derives nothing. *)
+  (* The structurally empty term, decided without taking a
+     derivative. *)
   check "the empty term is the empty language" (is_empty_language empty);
   check "eps is not" (not (is_empty_language eps));
-  (* Two automata far from minimal, where the product is the size of
-     the two multiplied and the traversal is their sum. Both are [a*],
-     as a 63-state cycle and a 64-state one: 5192 pairs as a product,
-     127 with the union-find. If the union-find ever stops collapsing
-     them, this check takes far too long to finish. *)
+  (* Two automata far from minimal, where a product construction visits
+     about the product of their sizes and the union-find traversal about
+     the sum. Both terms denote [a*], as a 63-state cycle and a 64-state
+     cycle: 5192 pairs as a product, 127 with the union-find. If the
+     union-find stops merging them, this check becomes very slow. *)
   let a = singleton_char 'a' in
   let rep n = seqs (List.init n (fun _ -> a)) in
   let cycle n = seq (star (rep n)) (star a) in
@@ -1881,9 +1905,9 @@ let check_emission ~label ~alphabet ~seed ~trials ~depth ~max_tokens =
              (name "a table cell is the transition")
              (tbl.Dfa.next.((id * k) + c) = expected))
         tbl.Dfa.classes);
-    (* A class is indivisible: every codepoint in it behaves the same
-       from every state, which is the property the whole table rests
-       on. Checked on the probes that fall in each class. *)
+    (* Every codepoint in a class has the same transition from every
+       state, which the table depends on. Checked on the probes that
+       fall in each class. *)
     Dfa.iter_states dfa (fun id ->
       let dest cp =
         match
@@ -1968,11 +1992,10 @@ let () =
     ~max_tokens:3
 ;;
 
-(* The counts a generator emits against, on a lexer-shaped automaton
-   rather than a random one. The class count saturates while the state
-   count grows with the keywords, which is the whole reason to emit a
-   table: 7 states and 8 classes with no keywords, 814 and 34 with two
-   hundred. *)
+(* State and class counts on a lexer-shaped automaton. The state count
+   grows with the number of keywords while the class count levels off,
+   which is why a code generator should emit a table: 7 states and 8
+   classes with no keywords, 814 and 34 with two hundred. *)
 let () =
   let base =
     [ seq
@@ -2032,10 +2055,10 @@ let () =
 
 (* -- what transitions_in does with the bounds it is given ------------------ *)
 
-(* The clipping window goes through [Ucharset.range], which validates
-   both ends whether or not the range is empty. A generator slicing
-   the codespace at arbitrary offsets meets that, so it is part of the
-   contract rather than an implementation detail leaking out. *)
+(* The clipping window is built with [Ucharset.range], which validates
+   both ends even when the range is empty. A generator that slices the
+   codespace at arbitrary offsets depends on this behaviour, so it is
+   tested as part of the contract. *)
 let () =
   let dfa = Dfa.of_tokens [ 0, str "ab"; 1, plus (range ~lo:0x20 ~hi:0x10FFFF) ] in
   let raises f =
@@ -2059,8 +2082,9 @@ let () =
   check
     "an empty range still validates its bounds"
     (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0xE000 ~hi:0xD800));
-  (* Straddling the block is fine, which is what keeps a caller
-     splitting by UTF-8 length clear of all of the above. *)
+  (* A window that spans the surrogate block is accepted, so a caller
+     splitting by UTF-8 length (0x800-0xFFFF for three bytes) never
+     hits the errors above. *)
   check
     "a window straddling the surrogates is accepted"
     (not (raises (fun () -> Dfa.transitions_in dfa 0 ~lo:0x800 ~hi:0xFFFF)));
@@ -2071,10 +2095,10 @@ let () =
 
 (* -- state budgets --------------------------------------------------------- *)
 
-(* The unbounded forms are the bounded ones at [max_int], so agreeing
-   with a generous bound is the whole of what makes that safe. The
-   tight bounds check the other half, that the budget stops the
-   traversal rather than being ignored. *)
+(* The unbounded forms are implemented as the bounded ones at
+   [max_int], so a bounded call with a generous budget must return the
+   same result as the unbounded one. The tight bounds check that the
+   budget stops the traversal. *)
 let () =
   let a = singleton_char 'a'
   and b = singleton_char 'b' in
@@ -2102,20 +2126,20 @@ let () =
          (Printf.sprintf "of_tokens_within at %d gives None" m)
          (Dfa.of_tokens_within ~max_states:m toks = None))
     [ 1; 0; -1 ];
-  (* The case the budget exists for. [.*a.{16}] is 131072 states and
-     [.*a.{20}] two million, so if the bound were ignored this check
-     would take the suite from a second to minutes rather than
-     failing. *)
+  (* The case the budget is for. [.*a.{16}] has 131072 states and
+     [.*a.{20}] two million, so if the bound were ignored these checks
+     would make the suite take minutes instead of a second. *)
   check
     "a 131072 state automaton is refused at 1000"
     (Dfa.of_tokens_within ~max_states:1000 [ 0, seqs (star any :: a :: dots 16) ] = None);
   check
     "a two million state automaton is refused at 1000"
     (Dfa.of_tokens_within ~max_states:1000 [ 0, seqs (star any :: a :: dots 20) ] = None);
-  (* The two decisions, the same way round. [.*a.{6}] is 128 states,
-     which both traverse in a millisecond or two; the automata above
-     are for the construction bound, where the budget makes the size
-     free. *)
+  (* The same checks for [equivalent_within] and
+     [is_empty_language_within]. [.*a.{6}] has 128 states, which both
+     traverse in a millisecond or two. The larger automata above are
+     used only for [of_tokens_within], where the budget stops
+     construction early, so their size costs nothing. *)
   let mid = seqs (star any :: a :: dots 6) in
   check
     "equivalent_within with room agrees with equivalent"
@@ -2129,8 +2153,9 @@ let () =
   check
     "is_empty_language_within under a tight bound gives None"
     (is_empty_language_within ~max_states:10 (inter mid (complement mid)) = None);
-  (* A bound of zero still answers where nothing has to be traversed,
-     the nullable test coming before the budget. *)
+  (* A bound of zero still returns an answer when no state has to be
+     visited, because the nullability and empty-term tests run before
+     the budget is checked. *)
   check
     "a nullable disagreement answers at a bound of zero"
     (equivalent_within ~max_states:0 eps a = Some false);
@@ -2143,9 +2168,9 @@ let () =
   check "and a pair needing a step does not" (equivalent_within ~max_states:0 a b = None)
 ;;
 
-(* Over random terms: a generous bound always reproduces the unbounded
-   answer, and some bound in between is [None] on both, so the budget
-   is doing something at both ends. *)
+(* Over random terms: a bound of [max_int] returns the unbounded
+   result, and a bound of one state returns [None] for some pairs but
+   not all, with any answer it does return being correct. *)
 let () =
   let st = Random.State.make [| 2718281 |] in
   let bounded_agrees = ref 0
@@ -2163,8 +2188,8 @@ let () =
       (Ast.is_empty_language_within ~max_states:max_int ar
        = Some (Ast.is_empty_language ar));
     incr bounded_agrees;
-    (* One state of budget is not enough for most pairs, and never
-       gives a wrong answer when it is. *)
+    (* A budget of one state is too small for most pairs; when it does
+       return an answer, the answer must be correct. *)
     match Ast.equivalent_within ~max_states:1 ar as_ with
     | None -> incr tight_refused
     | Some answer ->
@@ -2180,13 +2205,12 @@ let () =
 
 (* -- the intern table gives memory back ------------------------------------ *)
 
-(* Both measurements below rest on [Gc.compact] returning memory, and
-   OCaml 5.0 and 5.1 cannot: compaction was dropped in 5.0 and only
-   reintroduced in 5.2, so the call is there but reclaims nothing. The
-   library is unaffected, the weak table still collecting on its own;
-   it is the measurement that cannot see it happen, so on those two
-   runtimes the size checks are skipped and everything around them
-   still runs. *)
+(* Both measurements below depend on [Gc.compact] returning memory.
+   OCaml 5.0 and 5.1 have no compaction (it was removed in 5.0 and
+   restored in 5.2), so on them the call reclaims nothing. The weak
+   table is still collected on those runtimes, but the heap size does
+   not shrink to show it, so the size checks are skipped there and the
+   rest of each test still runs. *)
 let compaction_returns_memory =
   match String.split_on_char '.' Sys.ocaml_version with
   | major :: minor :: _ ->
@@ -2196,16 +2220,16 @@ let compaction_returns_memory =
   | _ -> true
 ;;
 
-(* Entries are weak, so transient terms are collected on their own. What
-   used to be retained was the bucket array around them: it was sized
-   from the number of terms interned since the last resize, and only
-   ever doubled, so its footprint tracked cumulative interning rather
-   than live entries. Interning half a million distinct terms and
-   dropping them all should leave the heap roughly where it started.
+(* Entries are weak, so unreferenced terms are collected by the GC.
+   This checks that the bucket array shrinks too. An array sized from
+   the number of terms interned since the last resize, and only ever
+   doubled, grows with total interning instead of with live entries.
+   Interning half a million distinct terms and dropping them all should
+   leave the heap roughly where it started.
 
-   Compacting more than once is deliberate. The shrink runs at the end
-   of a major cycle, so the array it releases is still garbage at that
-   point and is not reclaimed until the following one. *)
+   Compaction runs three times on purpose. The table shrinks at the end
+   of a major cycle, so the old array becomes garbage only then and is
+   reclaimed by the next cycle. *)
 let () =
   let compact () =
     for _ = 1 to 3 do
@@ -2231,9 +2255,9 @@ let () =
   ignore (Ast.tag !last);
   compact ();
   let after = live_mb () in
-  (* Before the fix this grew by about 12.5 MB at this size; after it,
-     by nothing measurable. The threshold sits an order of magnitude
-     clear of both. *)
+  (* Measured: an array that only grows adds about 12.5 MB at this
+     size; one that shrinks adds nothing measurable. The 4 MB threshold
+     is well clear of both. *)
   if compaction_returns_memory
   then
     check
@@ -2241,19 +2265,20 @@ let () =
       (after -. before < 4.0)
 ;;
 
-(* [rehash] re-measures the table only when something is interned, so a
+(* [rehash] resizes the table only when something is interned, so a
    program that builds a large automaton, drops it and then stops
-   interning holds the bucket array at its peak. [clear_cache] is the
-   release. Last in the file: it orphans every node interned before it,
-   so nothing built earlier may be used after. *)
+   interning keeps the bucket array at its peak size. [clear_cache]
+   releases it. This test is last in the file because [clear_cache]
+   invalidates every node interned before it, so nothing built earlier
+   can be used afterwards. *)
 let () =
   let live_mb () =
     float_of_int (Gc.quick_stat ()).Gc.heap_words
     *. float_of_int (Sys.word_size / 8)
     /. 1048576.
   in
-  (* [.*a.{16}] — 2^17 states, enough that the table is far past the
-     size it starts at. Built and dropped in one expression. *)
+  (* [.*a.{16}] has 2^17 states, enough to grow the table well past its
+     initial size. It is built and dropped in one expression. *)
   let states =
     Dfa.num_states
       (Dfa.of_tokens
@@ -2272,7 +2297,8 @@ let () =
     check
       (Printf.sprintf "clear_cache releases the table (%.2f -> %.2f MB)" held cleared)
       (cleared < held -. 2.0);
-  (* The constants are put back, so interning still finds them. *)
+  (* [clear_cache] re-interns the constants, so [eps], [empty] and
+     [any] still lower to the same nodes. *)
   check "eps survives a clear" (Ast.is_eps (to_ast eps));
   check "empty survives a clear" (Ast.is_empty (to_ast empty));
   check "any survives a clear" (Ast.equal (to_ast any) Ast.any)

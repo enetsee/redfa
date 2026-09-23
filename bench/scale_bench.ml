@@ -1,7 +1,8 @@
-(* Scales [deriv] along depth (the [seq_suffix] rebuild in
-   [deriv_seq]) and width (the fan-out over [Alt] children) using one
-   [rich k n] family, so only one varies at a time. Reports ns per
-   derivative, which divides out state count growth.
+(* Measures how the cost of [deriv] grows with depth [n] (the
+   [seq_suffix] rebuild in [deriv_seq]) and with width [k] (the
+   fan-out over [Alt] children), varying one parameter of [rich k n]
+   at a time. Reports ns per derivative, which divides out the growth
+   in state count.
 
    Run: dune exec --profile release bench/scale_bench.exe *)
 

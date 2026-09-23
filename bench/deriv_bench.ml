@@ -1,9 +1,13 @@
-(* Benchmarks the derivative and full DFA construction.
+(* Measures [deriv] and [approx_representatives] over a traversal of
+   every state reachable from each workload, the same exploration DFA
+   construction performs.
 
    Run: dune exec --profile release bench/deriv_bench.exe
 
-   Fresh child process per measurement: the hash-cons table and the
-   per-node approx memo are global. *)
+   Each measurement runs in a fresh child process, because the
+   hash-cons table and the per-node approx memo are global and a
+   second run in the same process would reuse the first run's
+   entries. *)
 
 open Redfa.Ast
 
@@ -69,7 +73,7 @@ let rich k b =
        seqs (List.init (b - 1) (fun j -> opt (cls j)) @ [ plus (cls (b - 1)) ])))
 ;;
 
-(* A boolean shape: intersections and complements. *)
+(* Alternatives built from intersections and complements. *)
 let boolean k =
   alts
     (List.init k (fun i ->
@@ -103,8 +107,10 @@ let clock f =
   (Unix.gettimeofday () -. t0) *. 1000., r
 ;;
 
-(* Full DFA construction, and the same traversal with the two phases timed
-   separately so their shares are visible. *)
+(* Visits every term reachable from [start] by derivatives, as DFA
+   construction does, and returns the state and derivative counts.
+   With [~split:true] it also times [approx_representatives] and
+   [deriv] separately, to show each one's share of the total. *)
 let build ?(split = false) start =
   let seen = H.create 1024 in
   let n_deriv = ref 0

@@ -2,14 +2,14 @@
 opam-version: "2.0"
 synopsis: "A derivative-based regex engine with intersection and complement"
 description: """
-Brzozowski derivatives over the Unicode codespace, with the boolean
-operations alongside the usual ones. Regexes are hash-consed into a normal form
-that quotients associativity, commutativity and idempotence, which is what
-leaves finitely many derivatives and makes DFA construction terminate. On top
-of that: minimisation to the Myhill-Nerode minimum, exact decisions for
-emptiness and language equivalence by Hopcroft-Karp over derivatives, state
-budgets so an untrusted pattern cannot run away with the machine, and the
-character classes and transition table a code generator emits against."""
+Brzozowski derivatives over the Unicode codespace, with intersection and
+complement as well as the usual operations. Regexes are hash-consed into a
+normal form that identifies terms differing only by associativity,
+commutativity and idempotence, so every regex has finitely many derivatives
+and DFA construction terminates. Also: minimisation to the Myhill-Nerode
+minimum, exact emptiness and equivalence checks by Hopcroft-Karp over
+derivatives, state budgets that bound the work done on untrusted patterns, and
+the character classes and transition table for a code generator to emit."""
 maintainer: ["Michael Thomas <mthomas180@gmail.com>"]
 authors: ["Michael Thomas <mthomas180@gmail.com>"]
 license: "MIT"

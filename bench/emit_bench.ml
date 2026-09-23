@@ -1,19 +1,21 @@
-(* What a code generator emits against, for the two views in [Dfa]'s
+(* Measures the size of generated code for the two views in [Dfa]'s
    emission section.
 
    A generator turns each state's [transitions] into a chain of
    interval tests, and emits that chain once per range it has a fast
-   path for (typically one for the byte that is its own codepoint in
-   UTF-8, one for the rest). The "arms x2" column is what that costs
-   with the whole dispatch on both sides; "split" is the same with
-   [transitions_in] asked once per range.
+   path for (typically one for ASCII, where a UTF-8 byte is its own
+   codepoint, and one for the rest). The "arms x2" column counts the
+   arms when both copies test every transition; "split" counts them
+   when each copy uses [transitions_in] restricted to its range.
 
-   [Dfa.table] is the other view; the classes the automaton
-   distinguishes, and a states by classes array. Emitting it is a
-   class set and a cell per pair, against an arm per transition.
+   [Dfa.table] is the other view: the character classes the automaton
+   distinguishes, and an array indexed by state and class. Emitting it
+   costs one charset per class and one cell per (state, class) pair,
+   compared with one arm per transition above. "packed B" is the total
+   length of the classes as [Ucharset.to_packed_string].
 
-   These are code sizes rather than timings. The one time here is what
-   [Dfa.table] costs to build at codegen time.
+   Every column is a code size except "build ms", which measures how
+   long [Dfa.table] takes to build at codegen time.
 
    Run: dune exec --profile release bench/emit_bench.exe *)
 

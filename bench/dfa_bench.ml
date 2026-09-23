@@ -1,7 +1,8 @@
-(* Benchmarks [Dfa.of_tokens] and [Dfa.minimise]. Tokens go in as
-   separate rules, the path that exercises the multi-item joint
-   partition. Fresh child process per measurement, the hash-cons table
-   and approx memo being global.
+(* Measures [Dfa.of_tokens] and [Dfa.minimise]. Each token is passed
+   as a separate rule, so construction computes the joint partition
+   over several items per state. Each measurement runs in a fresh
+   child process, because the hash-cons table and the approx memo are
+   global.
 
    Run: dune exec --profile release bench/dfa_bench.exe *)
 
@@ -17,9 +18,10 @@ let clock f =
 
 let numbered rs = List.mapi (fun i r -> i, r) rs
 
-(* The counts a code generator emits against: one arm per transition,
-   and the intervals of each arm's charset. The last column gives the
-   same counts with transitions coalesced by destination. *)
+(* Prints the counts that determine the size of generated code: the
+   transitions (one arm each) and the intervals in their charsets.
+   The third and fifth numbers are the same two counts after merging
+   the transitions that share a destination. *)
 let shape_of workload =
   let toks = numbered ((List.assoc workload workloads) ()) in
   let dfa = Dfa.of_tokens toks in
