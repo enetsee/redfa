@@ -841,23 +841,67 @@ let emit_charset_brackets ~negated buf cs =
 let emit_charset buf cs =
   if Ucharset.is_empty cs
   then raise (Emission_failed "empty language has no Oniguruma representation")
+  else if Ucharset.is_all cs
+  then
+    (* [[\s\S]] matches any character including newline, which [.]
+       excludes. It also covers the surrogates, which [Ucharset.all]
+       leaves out; UTF-8 input contains none. *)
+    Buffer.add_string buf "[\\s\\S]"
   else if Ucharset.is_singleton cs
   then (
     match Ucharset.choose_opt cs with
     | Some cp -> cp_outside_charset buf cp
     | None -> assert false)
-  else emit_charset_brackets ~negated:false buf cs
+  else (
+    (* Use whichever spelling has fewer intervals, as [chars_or_neg]
+       does. For example, the set of every codepoint but a quote and a
+       backslash is one negated class of two characters, where written
+       out positively it is three ranges up to U+10FFFF. *)
+    let d = Ucharset.comp cs in
+    if Ucharset.num_intervals d < Ucharset.num_intervals cs
+    then emit_charset_brackets ~negated:true buf d
+    else emit_charset_brackets ~negated:false buf cs)
 ;;
 
-(* [Neg_chars cs] denotes [comp cs]. Negating the empty set goes out
-   as a positive full range class, and negating the whole codespace
-   raises. *)
-let emit_charset_negated buf cs =
-  if Ucharset.is_empty cs
-  then emit_charset_brackets ~negated:false buf Ucharset.all
-  else if Ucharset.is_empty (Ucharset.comp cs)
-  then raise (Emission_failed "empty language has no Oniguruma representation")
-  else emit_charset_brackets ~negated:true buf cs
+(* [Neg_chars cs] denotes [comp cs]. [emit_charset] negates it back if
+   that's shorter. *)
+let emit_charset_negated buf cs = emit_charset buf (Ucharset.comp cs)
+
+(* Same as [Ast.narrows], on this syntax tree: the set of length-one
+   strings [c] matches, where that follows from [Chars], [Neg_chars],
+   [Complement] and [Inter]. *)
+let rec narrows c =
+  match c with
+  | Chars set -> Some set
+  | Neg_chars set -> Some (Ucharset.comp set)
+  | Complement inner -> Option.map Ucharset.comp (narrows inner)
+  | Inter items ->
+    List.fold_left
+      (fun acc item ->
+         match acc, narrows item with
+         | Some acc, Some set -> Some (Ucharset.inter acc set)
+         | _ -> None)
+      (Some Ucharset.all)
+      items
+  | _ -> None
+;;
+
+(* [Some cs] if [c] is an intersection equal to the charset [cs].
+
+   [narrows c] gives the length-one strings [c] matches, but [c] can
+   match longer strings too: [Inter \[Complement (Chars s)\]] also
+   matches [""] and ["ab"]. A [Chars] or [Neg_chars] operand restricts
+   the intersection to length-one strings, and then [c] equals its
+   [narrows] set. *)
+let as_charset c =
+  match c with
+  | Inter items
+    when List.exists
+           (function
+             | Chars _ | Neg_chars _ -> true
+             | _ -> false)
+           items -> narrows c
+  | _ -> None
 ;;
 
 let rec emit_top buf c =
@@ -894,19 +938,18 @@ let rec emit_top buf c =
       (Emission_failed
          "complement is over the language, which Oniguruma has no form for; for a \
           negated character class use not_chars")
+  (* An intersection is emitted as a charset when [as_charset] gives
+     one, and is an error otherwise. *)
   | Inter xs ->
-    let cs_opts = List.map charset_of xs in
-    if List.for_all Option.is_some cs_opts
-    then (
-      match List.map Option.get cs_opts with
-      | [] -> raise (Emission_failed "empty intersection is unreachable here")
-      | first :: rest ->
-        let combined = List.fold_left Ucharset.inter first rest in
-        emit_charset buf combined)
-    else
-      raise
-        (Emission_failed
-           "an intersection over anything but character classes has no Oniguruma form")
+    (match as_charset c with
+     | Some cs -> emit_charset buf cs
+     | None ->
+       (match xs with
+        | [] -> raise (Emission_failed "empty intersection is unreachable here")
+        | _ ->
+          raise
+            (Emission_failed
+               "an intersection over anything but character classes has no Oniguruma form")))
 
 and emit_factor buf c =
   match c with
@@ -919,9 +962,9 @@ and emit_factor buf c =
 and emit_atom buf c =
   match c with
   | Chars _ | Neg_chars _ -> emit_top buf c
-  | Inter xs when List.for_all (fun x -> Option.is_some (charset_of x)) xs ->
-    (* Inter that lowers to a charset is also atomic. *)
-    emit_top buf c
+  (* An Inter that emits as a charset is atomic too, so a [*] after
+     it needs no group. *)
+  | Inter _ when Option.is_some (as_charset c) -> emit_top buf c
   | _ ->
     Buffer.add_string buf "(?:";
     emit_top buf c;

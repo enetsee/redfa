@@ -552,6 +552,61 @@ let () =
     [ "\\&"; "a\\&b"; "\\~"; "\\~*"; "a\\&b|\\~" ]
 ;;
 
+(* -- an intersection that denotes a character class ------------------------
+
+   [inter any (complement cs)] is the same language as [not_chars cs],
+   so it should be the same term and emit the same Oniguruma. *)
+
+let () =
+  List.iter
+    (fun (name, s) ->
+       let long = inter any (complement (chars s))
+       and short = not_chars s in
+       let say what = Printf.sprintf "%s: %s" name what in
+       check (say "inter any (complement cs) is not_chars cs") (same_form long short);
+       match to_oniguruma long, to_oniguruma short with
+       | Ok a, Ok b -> check (say "both spellings emit alike") (a = b)
+       | Error a, Error b -> check (say "both spellings refuse alike") (a = b)
+       | Ok a, Error b | Error b, Ok a ->
+         check (say (Printf.sprintf "spellings disagree: %S vs %S" a b)) false)
+    [ "quote and backslash", Ucharset.of_char_list [ '"'; '\\' ]
+    ; "one letter", Ucharset.singleton_char 'a'
+    ; "the digits", Ucharset.range_char ~lo:'0' ~hi:'9'
+    ; "the empty set", Ucharset.empty
+    ; "the whole codespace", Ucharset.all
+    ]
+;;
+
+(* An intersection with no [Chars] operand can match strings of other
+   lengths: [Inter [~a]] matches [""] and ["ab"]. So it is a different
+   language from [\[^a\]], and has no Oniguruma form. *)
+let () =
+  let a = Ucharset.singleton_char 'a' in
+  let bare = Inter [ Complement (Chars a) ] in
+  check "Inter [~a] takes the empty string" (Ast.eval (to_ast bare) "");
+  check "Inter [~a] takes \"ab\"" (Ast.eval (to_ast bare) "ab");
+  check "Inter [~a] is not [^a]" (not (same_form bare (not_chars a)));
+  check "Inter [~a] has no Oniguruma form" (Result.is_error (to_oniguruma bare));
+  (* [Inter []] has no [Chars] operand either. *)
+  check "Inter [] is the universal language" (same_form (Inter []) (star any));
+  (* An operand with no [narrows] set stays in the intersection, so
+     the result is [a & b*] rather than [a]. *)
+  let live = Inter [ Chars a; Star (Chars (Ucharset.singleton_char 'b')) ] in
+  check "a & b* matches nothing" (not (Ast.eval (to_ast live) "a"));
+  check "a & b* is not [a]" (not (same_form live (chars a)))
+;;
+
+(* The whole codespace emits as [[\s\S]], which includes newline. *)
+let () =
+  check "any emits [\\s\\S]" (to_oniguruma any = Ok "[\\s\\S]");
+  check
+    "not_chars empty emits [\\s\\S]"
+    (to_oniguruma (not_chars Ucharset.empty) = Ok "[\\s\\S]");
+  match of_string "[\\s\\S]" with
+  | Error e -> check (Printf.sprintf "[\\s\\S] is unparseable: %s" e.msg) false
+  | Ok back -> check "[\\s\\S] reads back as any" (same_form back any)
+;;
+
 (* -- the Oniguruma output against Oniguruma --------------------------------
 
    The round trips above read [to_oniguruma]'s output back with redfa's
@@ -1712,7 +1767,9 @@ let () =
   equiv_beyond_aci "~(a|b)" "~a&~b";
   equiv_beyond_aci "~(a&b)" "~a|~b";
   equiv_beyond_aci "(a|b)*" "(a*b*)*";
-  equiv_beyond_aci "a&~a" "[^\\u{0}-\\u{10FFFF}]";
+  (* The normal form folds [a&~a] to empty, so this uses [aa&~(aa)]:
+     the same law on length-two strings, which the fold leaves alone. *)
+  equiv_beyond_aci "aa&~(aa)" "[^\\u{0}-\\u{10FFFF}]";
   equiv_beyond_aci "\\u{3BB}*\\u{3BB}*" "\\u{3BB}*";
   (* Two the normal form does see, kept because they are the shapes a
      reader expects here: merging the classes of an [Alt] is exactly
@@ -1732,13 +1789,15 @@ let () =
        check
          (Printf.sprintf "%S is not the empty term" src)
          (not (Ast.is_empty (to_ast (p src)))))
-    [ "a&~a"; "a.*&b.*"; "a*&~(a*)"; "~(.*)"; "ab&ba" ];
-  (* Emptiness the normal form does see, through the intersection of
-     two disjoint classes. Cheap, and the answer has to be the same. *)
+    [ "aa&~(aa)"; "a.*&b.*"; "a*&~(a*)"; "~(.*)"; "ab&ba" ];
+  (* Emptiness the normal form does see: a class intersected with a
+     disjoint class, or with the complement of a class containing it. *)
   List.iter
     (fun src ->
-       check (Printf.sprintf "%S is the empty language" src) (is_empty_language (p src)))
-    [ "a&b"; "(a&b)c" ];
+       check (Printf.sprintf "%S is the empty language" src) (is_empty_language (p src));
+       check (Printf.sprintf "%S is the empty term" src) (Ast.is_empty (to_ast (p src))))
+    [ "a&b"; "a&~a"; ".&~."; "a&~(a|b)" ];
+  check "(a&b)c is the empty language" (is_empty_language (p "(a&b)c"));
   List.iter
     (fun src ->
        check

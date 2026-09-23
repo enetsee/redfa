@@ -520,6 +520,28 @@ let split_chars_for_inter ts =
   , !rest )
 ;;
 
+(* The set of length-one strings [t] matches, for [Chars], and for
+   [Not] and [Inter] built from those; [None] for any other term.
+
+   The length-one strings in [Not x] are the complement of those in
+   [x], and those in an [Inter] are the intersection of its children's.
+   Both hold whatever the terms match at other lengths, so the result
+   describes length one only: [Not (Chars s)] also matches [""]. *)
+let rec narrows (t : t) =
+  match t.node with
+  | Chars c -> Some c
+  | Not x -> Option.map Ucharset.comp (narrows x)
+  | Inter xs ->
+    List.fold_left
+      (fun acc x ->
+         match acc, narrows x with
+         | Some acc, Some c -> Some (Ucharset.inter acc c)
+         | _ -> None)
+      (Some Ucharset.all)
+      xs
+  | Seq _ | Alt _ | Star _ -> None
+;;
+
 let inters ts =
   match ts with
   | [] ->
@@ -531,6 +553,24 @@ let inters ts =
     else (
       let flat = List.concat_map inter_children ts in
       let saw_chars, cs, rest = split_chars_for_inter flat in
+      (* With a [Chars] child the intersection matches length-one
+         strings only, so each other child with a [narrows] set is
+         intersected into [cs]. This makes
+         [inter any (complement (chars s))] the same term as
+         [chars (comp s)]; as two terms they would derive separately
+         and give the DFA a duplicate state. *)
+      let cs, rest =
+        if saw_chars
+        then
+          List.fold_left
+            (fun (cs, keep) t ->
+               match narrows t with
+               | Some c -> Ucharset.inter cs c, keep
+               | None -> cs, t :: keep)
+            (cs, [])
+            rest
+        else cs, rest
+      in
       if saw_chars && Ucharset.is_empty cs
       then empty
       else (

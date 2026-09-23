@@ -26,6 +26,11 @@ module Ast : sig
       finite set of terms, which is what makes DFA construction
       terminate.
 
+      An [Inter] with a [Chars] child matches single codepoints only,
+      so its other children are intersected into that charset where
+      possible: [inter any (complement (chars s))] becomes
+      [chars (comp s)], and [a & ~a] becomes the empty term.
+
       [t] is abstract. It carries a tag and memo slots that serve [deriv]
       and [approx_partition]. Nothing here is stable. *)
 
@@ -371,9 +376,18 @@ module Regex : sig
 
   (** {2 Emission} *)
 
-  (** Oniguruma source. [Error] where the term has no Oniguruma form: a
-      [Complement], an [Inter] over anything but charsets, or the empty
-      language. *)
+  (** Oniguruma source. [Error] where the term has no Oniguruma form:
+      a [Complement], an [Inter] that does not denote a character
+      class, or the empty language.
+
+      An [Inter] with a [Chars] or [Neg_chars] child matches single
+      codepoints only, so it emits as a character class when its other
+      children are charsets or complements of charsets. For example
+      [inter any (complement (chars s))] emits as [\[^s\]].
+
+      A class is emitted negated when that has fewer intervals. The
+      whole codespace is emitted as [\[\\s\\S\]], which includes
+      newline. *)
   val to_oniguruma : t -> (string, string) result
 
   (** {2 Pretty-printing}
