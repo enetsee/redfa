@@ -320,10 +320,12 @@ module Regex : sig
       one repeat that follows it, so [~ab] parses as [(~a)b]; write
       [~(ab)] to complement the sequence.
 
-      Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the shorthand
-      classes [\d], [\w], [\s] with their negations, and a backslash
-      before any printable ASCII character other than a letter or
-      digit, which matches that character literally. Space, the C0
+      Escapes are [\t], [\n], [\r], [\f], [\0], [\xHH], [\u{HHHH}], the
+      shorthand classes [\d], [\w], [\s] with their negations, and a
+      backslash before any printable ASCII character other than a
+      letter or digit, which matches that character literally. [\xHH]
+      takes two hex digits and a value up to [7F]; [\u{HHHH}] takes
+      any scalar value. Space, the C0
       controls and DEL match themselves unescaped, and a backslash
       before one is an error. *)
 
@@ -388,7 +390,15 @@ module Regex : sig
 
       A class is emitted negated when that has fewer intervals. The
       whole codespace is emitted as [\[\\s\\S\]], which includes
-      newline. *)
+      newline.
+
+      Tab, newline and carriage return are emitted as [\t], [\n] and
+      [\r], and the other ASCII control characters as [\xHH], so the
+      output holds no control character and no U+0000. A codepoint
+      from U+0080 up is emitted as the character itself, so the output
+      is UTF-8. Oniguruma refuses a pattern that holds [\u\{HHHH\}],
+      and the character is the one spelling of these codepoints that
+      Oniguruma, Ruby and {!of_string} all read. *)
   val to_oniguruma : t -> (string, string) result
 
   (** {2 Pretty-printing}

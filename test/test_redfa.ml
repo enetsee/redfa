@@ -395,6 +395,23 @@ let () =
   errors_with
     "\\u{FFFFFFFFFFFFFFFF}"
     "\\u{FFFFFFFFFFFFFFFF} is not a Unicode scalar value";
+  (* [\xHH] takes exactly two hex digits, in either case, and a value
+     up to 7F. A third hex digit is a literal. *)
+  parses_as "\\x00" (singleton 0x00);
+  parses_as "\\x1f" (singleton 0x1F);
+  parses_as "\\x1F" (singleton 0x1F);
+  parses_as "\\x41" (singleton 0x41);
+  parses_as "\\x7F" (singleton 0x7F);
+  parses_as "\\x41A" (seq (singleton 0x41) (singleton 0x41));
+  parses_as "[\\x00-\\x1F]" (chars (Ucharset.range ~lo:0x00 ~hi:0x1F));
+  errors_with "\\x" "\\x escape takes two hex digits";
+  errors_with "\\x4" "\\x escape takes two hex digits";
+  errors_with "\\x4g" "\\x escape takes two hex digits";
+  errors_with "\\x{41}" "\\x escape takes two hex digits";
+  (* Oniguruma and Ruby read [\x80] as a byte, so a value above 7F is
+     refused here, and the message gives the escape for the codepoint. *)
+  errors_with "\\x80" "\\x80 is above \\x7F, write \\u{80} for the codepoint";
+  errors_with "\\xff" "\\xFF is above \\x7F, write \\u{FF} for the codepoint";
   (* The message for an unknown escape quotes the whole character
      after the backslash. Quoting only its first byte, as [%c] does,
      gives a message that is invalid UTF-8 when the character is
@@ -616,6 +633,78 @@ let () =
   | Ok back -> check "[\\s\\S] reads back as any" (same_form back any)
 ;;
 
+(* How a codepoint outside printable ASCII is emitted: tab, newline and
+   carriage return as [\t], [\n] and [\r], the other ASCII control
+   characters as [\xHH], and a codepoint from U+0080 up as itself, in
+   UTF-8.
+
+   The defect this guards against: U+03BB was emitted as [\u{3BB}].
+   Ruby reads that escape and Oniguruma refuses it as an invalid code
+   point value, so the check against Ruby below agreed with every row
+   while a TextMate grammar holding the pattern failed to load. These
+   checks compare the emitted text, so they run on every machine. The
+   check against Oniguruma itself, below, runs only where
+   vscode-oniguruma is installed. *)
+let () =
+  let emits what r expected =
+    check (Printf.sprintf "%s emits %S" what expected) (to_oniguruma r = Ok expected)
+  in
+  emits "U+03BB" (singleton 0x3BB) "\xCE\xBB";
+  emits "U+10400" (singleton 0x10400) "\xF0\x90\x90\x80";
+  emits "U+0080" (singleton 0x80) "\xC2\x80";
+  emits
+    "a class over two scripts"
+    (chars
+       (Ucharset.union
+          (Ucharset.range ~lo:0xC0 ~hi:0xFF)
+          (Ucharset.range ~lo:0x391 ~hi:0x3C9)))
+    "[\xC3\x80-\xC3\xBF\xCE\x91-\xCF\x89]";
+  emits "U+0000" (singleton 0x00) "\\x00";
+  emits "U+0001" (singleton 0x01) "\\x01";
+  emits "U+001F" (singleton 0x1F) "\\x1F";
+  emits "U+007F" (singleton 0x7F) "\\x7F";
+  emits "U+0009" (singleton 0x09) "\\t";
+  emits "U+000A" (singleton 0x0A) "\\n";
+  emits "U+000D" (singleton 0x0D) "\\r";
+  (* A string body in a lexer: any character but a quote, a backslash
+     and the C0 controls. *)
+  emits
+    "a class excluding the C0 controls"
+    (not_chars
+       (Ucharset.union
+          (Ucharset.range ~lo:0x00 ~hi:0x1F)
+          (Ucharset.of_char_list [ '"'; '\\' ])))
+    "[^\\x00-\\x1F\"\\\\]";
+  (* The output holds no ASCII control character, so it holds no
+     U+0000 for a C string to end at. Checked on each ASCII codepoint
+     as a literal, in a negated class and next to another character,
+     and on random terms over [meta_alphabet], which has NUL, tab,
+     newline and DEL. *)
+  let control ch = Char.code ch < 0x20 || Char.code ch = 0x7F in
+  let raw = ref 0
+  and emitted = ref 0 in
+  let scan r =
+    match to_oniguruma r with
+    | Error _ -> ()
+    | Ok oni ->
+      incr emitted;
+      if String.exists control oni then incr raw
+  in
+  for cp = 0x00 to 0x7F do
+    scan (singleton cp);
+    scan (not_singleton cp);
+    scan (seq (singleton cp) (singleton 0x41));
+    scan (chars (Ucharset.range ~lo:cp ~hi:(cp + 2)))
+  done;
+  let st = Random.State.make [| 2718 |] in
+  for _ = 1 to 2000 do
+    scan (fst (gen ~alphabet:meta_alphabet st 3))
+  done;
+  check
+    (Printf.sprintf "%d of %d emitted terms hold a control character" !raw !emitted)
+    (!raw = 0 && !emitted > 1000)
+;;
+
 (* -- the Oniguruma output against Oniguruma --------------------------------
 
    The round trips above parse [to_oniguruma]'s output with redfa's own
@@ -625,13 +714,29 @@ let () =
    usually shows up as exactly that difference: the [&] and [~] defect
    parsed cleanly in redfa and meant something else in Oniguruma.
 
-   The check runs Ruby, whose regex engine, Onigmo, is a fork of
-   Oniguruma. Each row sends the emitted source and one witness string,
-   both hex encoded so the shell and encoding layers pass the bytes
-   through unchanged. The script anchors the pattern as \A(?:...)\z,
-   since [eval] matches whole strings, and prints every disagreement.
-   When there is no ruby on the PATH the check is skipped and prints a
-   SKIPPED line, so the missing coverage is visible. *)
+   Each row sends the emitted source and one witness string, both hex
+   encoded so the shell and encoding layers pass the bytes through
+   unchanged. The script anchors the pattern as \A(?:...)\z, since
+   [eval] matches whole strings, and prints every disagreement.
+
+   The rows go to two engines. An engine that cannot run here is
+   skipped and prints a SKIPPED line, so the missing coverage is
+   visible.
+
+   The first is Ruby, whose regex engine, Onigmo, is a fork of
+   Oniguruma. Ruby is installed on most machines, but it reads hex
+   escapes differently from Oniguruma. Ruby parses [\u{HHHH}] itself,
+   passes Onigmo the character, and refuses [\x{HHHH}]. Oniguruma
+   reads [\x{HHHH}] and refuses [\u{HHHH}] as an invalid code point
+   value. When [to_oniguruma] wrote [\u{HHHH}], Ruby agreed with every
+   row and Oniguruma refused 36 of the 127 patterns in the meta rows.
+
+   The second is vscode-oniguruma, which is Oniguruma compiled to
+   WebAssembly and the engine VS Code runs TextMate grammars on. It
+   runs under node when the package is found, either in the directory
+   the environment variable REDFA_VSCODE_ONIGURUMA names or by node's
+   module resolution from the working directory. The second way finds
+   a node_modules directory at the root of the repository. *)
 
 let utf_8_of_cp cp =
   let b = Buffer.create 4 in
@@ -656,8 +761,9 @@ let meta_corpus =
   ("" :: singles) @ pairs |> List.sort_uniq String.compare
 ;;
 
-let onig_script =
+let ruby_script =
   {ruby|
+exit 0 if ARGV[0] == "--available"
 fails = 0
 total = 0
 STDIN.each_line do |line|
@@ -682,7 +788,107 @@ puts "TOTAL #{total} #{fails}"
 |ruby}
 ;;
 
-let have_ruby = Sys.command "ruby -e '' >/dev/null 2>&1" = 0
+(* The same protocol as the Ruby script. A scanner is compiled for each
+   row, as [Regexp.new] is there. *)
+let node_script =
+  {js|
+const fs = require('fs');
+const path = require('path');
+const { createRequire } = require('module');
+const fromCwd = createRequire(path.join(process.cwd(), 'redfa'));
+const dir = process.env.REDFA_VSCODE_ONIGURUMA
+  || path.dirname(fromCwd.resolve('vscode-oniguruma/package.json'));
+const onig = require(path.join(dir, 'release', 'main.js'));
+const wasm = fs.readFileSync(path.join(dir, 'release', 'onig.wasm'));
+const bytes = wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength);
+// Quoted, with each character outside printable ASCII as \u{HHHH}, so
+// that a control character in a report is visible.
+const show = (s) => JSON.stringify(s).replace(/[^\x20-\x7e]/gu,
+  (c) => '\\u{' + c.codePointAt(0).toString(16).toUpperCase() + '}');
+onig.loadWASM(bytes).then(() => {
+  if (process.argv[2] === '--available') return;
+  let fails = 0;
+  let total = 0;
+  for (const line of fs.readFileSync(0, 'latin1').split('\n')) {
+    if (line === '') continue;
+    const [hp, hw, exp] = line.split('\t');
+    const pat = Buffer.from(hp, 'hex').toString('utf8');
+    const wit = Buffer.from(hw, 'hex').toString('utf8');
+    total += 1;
+    let scanner;
+    try {
+      scanner = new onig.OnigScanner(['\\A(?:' + pat + ')\\z']);
+    } catch (e) {
+      console.log(`COMPILE ${show(pat)}: ${e.message}`);
+      fails += 1;
+      continue;
+    }
+    const str = new onig.OnigString(wit);
+    const got = scanner.findNextMatchSync(str, 0) ? '1' : '0';
+    str.dispose();
+    scanner.dispose();
+    if (got !== exp) {
+      console.log(`MATCH ${show(pat)} on ${show(wit)}: redfa says ${exp}, oniguruma ${got}`);
+      fails += 1;
+    }
+  }
+  console.log(`TOTAL ${total} ${fails}`);
+}).catch((e) => {
+  console.log(String(e));
+  process.exit(1);
+});
+|js}
+;;
+
+type engine =
+  { name : string (* the engine, as labels and messages give it *)
+  ; program : string
+  ; script : string
+  ; missing : string (* what the SKIPPED line says *)
+  }
+
+let onigmo =
+  { name = "onigmo"
+  ; program = "ruby"
+  ; script = ruby_script
+  ; missing = "no ruby on PATH, so to_oniguruma is not checked against Onigmo"
+  }
+;;
+
+let oniguruma =
+  { name = "oniguruma"
+  ; program = "node"
+  ; script = node_script
+  ; missing =
+      "node cannot load vscode-oniguruma, so to_oniguruma is not checked against \
+       Oniguruma itself; set REDFA_VSCODE_ONIGURUMA to the package directory"
+  }
+;;
+
+let write_file path s =
+  let oc = open_out_bin path in
+  output_string oc s;
+  close_out oc
+;;
+
+(* Runs [f] on a temporary file holding the engine's script. *)
+let with_script engine f =
+  let path = Filename.temp_file "redfa_onig" ".script" in
+  write_file path engine.script;
+  Fun.protect ~finally:(fun () -> Sys.remove path) (fun () -> f path)
+;;
+
+(* Whether the engine runs here. Given [--available], each script exits
+   with status 0 once it has loaded everything it uses. *)
+let available engine =
+  with_script engine (fun script ->
+    Sys.command
+      (Printf.sprintf
+         "%s %s --available >/dev/null 2>&1"
+         engine.program
+         (Filename.quote script))
+    = 0)
+;;
 
 (* One line per (term, witness): the emitted source, the witness, and
    what [eval] returns for the term the source was emitted from. *)
@@ -713,24 +919,19 @@ let onig_rows ~alphabet ~witnesses ~seed ~n =
   !terms, Buffer.contents rows
 ;;
 
-let run_onig ~label ~rows =
-  let script = Filename.temp_file "redfa_onig" ".rb" in
+let run_onig engine ~label ~rows =
   let data = Filename.temp_file "redfa_onig" ".tsv" in
   let out = Filename.temp_file "redfa_onig" ".out" in
-  let write path s =
-    let oc = open_out_bin path in
-    output_string oc s;
-    close_out oc
-  in
-  write script onig_script;
-  write data rows;
+  write_file data rows;
   let rc =
-    Sys.command
-      (Printf.sprintf
-         "ruby %s < %s > %s 2>&1"
-         (Filename.quote script)
-         (Filename.quote data)
-         (Filename.quote out))
+    with_script engine (fun script ->
+      Sys.command
+        (Printf.sprintf
+           "%s %s < %s > %s 2>&1"
+           engine.program
+           (Filename.quote script)
+           (Filename.quote data)
+           (Filename.quote out)))
   in
   let lines =
     let ic = open_in_bin out in
@@ -743,20 +944,28 @@ let run_onig ~label ~rows =
     in
     go []
   in
-  List.iter Sys.remove [ script; data; out ];
-  check (Printf.sprintf "%s: ruby ran" label) (rc = 0);
+  List.iter Sys.remove [ data; out ];
+  check (Printf.sprintf "%s: %s ran" label engine.program) (rc = 0);
   let total =
     List.filter (fun l -> String.length l >= 5 && String.sub l 0 5 = "TOTAL") lines
   in
   let bad = List.filter (fun l -> not (List.mem l total)) lines in
-  (* Report the disagreements themselves, capped, then the count. *)
-  List.iteri (fun i l -> if i < 10 then check (Printf.sprintf "%s: %s" label l) false) bad;
+  (* Report the disagreements themselves, capped, then the count. A
+     pattern the engine refuses gives the same line for each of its
+     witnesses, so each distinct line is reported once. *)
+  let distinct =
+    List.rev
+      (List.fold_left (fun acc l -> if List.mem l acc then acc else l :: acc) [] bad)
+  in
+  List.iteri
+    (fun i l -> if i < 10 then check (Printf.sprintf "%s: %s" label l) false)
+    distinct;
   check
-    (Printf.sprintf "%s: %d disagreements with onigmo" label (List.length bad))
+    (Printf.sprintf "%s: %d disagreements with %s" label (List.length bad) engine.name)
     (bad = []);
   match total with
-  | [ t ] -> Printf.printf "  %s: onigmo agreed, %s\n" label t
-  | _ -> check (Printf.sprintf "%s: ruby produced no TOTAL line" label) false
+  | [ t ] -> if bad = [] then Printf.printf "  %s: %s agreed, %s\n" label engine.name t
+  | _ -> check (Printf.sprintf "%s: %s produced no TOTAL line" label engine.program) false
 ;;
 
 (* Constructs Oniguruma has and redfa lacks (repetition counts, POSIX
@@ -815,21 +1024,93 @@ let onig_adversarial_rows () =
   !terms, Buffer.contents rows
 ;;
 
+(* Single codepoints, each as a literal, as a negated class, at the
+   start and the end of a range, and before the letter A. [\xHH] ends
+   after two digits, and the term with A checks that both engines read
+   a hex digit that follows it as a literal.
+
+   The generator draws from [meta_alphabet], which has two ASCII
+   control characters emitted as [\xHH], four codepoints emitted as
+   themselves, and none from U+0080 to U+00FF. This list has every
+   codepoint up to U+00FF, which covers the C0 and C1 controls, then
+   the first and last codepoint of each UTF-8 length, both sides of the
+   surrogates, and the line and paragraph separators. *)
+let onig_codepoint_rows () =
+  let scalar cp = cp >= 0 && cp <= 0x10FFFF && not (cp >= 0xD800 && cp <= 0xDFFF) in
+  let cps =
+    List.init 0x100 (fun cp -> cp)
+    @ [ 0x3BB
+      ; 0x7FF
+      ; 0x800
+      ; 0x2028
+      ; 0x2029
+      ; 0xD7FF
+      ; 0xE000
+      ; 0xFEFF
+      ; 0xFFFF
+      ; 0x10000
+      ; 0x10400
+      ; 0x10FFFF
+      ]
+  in
+  let rows = Buffer.create (1 lsl 16) in
+  let terms = ref 0 in
+  List.iter
+    (fun cp ->
+       let range lo hi =
+         if scalar lo && scalar hi then [ chars (Ucharset.range ~lo ~hi) ] else []
+       in
+       let witnesses =
+         (""
+          :: List.filter_map
+               (fun c -> if scalar c then Some (utf_8_of_cp c) else None)
+               [ cp - 3; cp - 2; cp - 1; cp; cp + 1; cp + 2; cp + 3 ])
+         @ [ utf_8_of_cp cp ^ "A"; "A" ]
+       in
+       List.iter
+         (fun r ->
+            match to_oniguruma r with
+            | Error _ -> ()
+            | Ok oni ->
+              incr terms;
+              let a = to_ast r in
+              List.iter
+                (fun w ->
+                   Buffer.add_string rows (hex oni);
+                   Buffer.add_char rows '\t';
+                   Buffer.add_string rows (hex w);
+                   Buffer.add_char rows '\t';
+                   Buffer.add_string rows (if Ast.eval a w then "1" else "0");
+                   Buffer.add_char rows '\n')
+                witnesses)
+         ([ singleton cp; not_singleton cp; seq (singleton cp) (singleton 0x41) ]
+          @ range cp (cp + 2)
+          @ range (cp - 2) cp))
+    cps;
+  !terms, Buffer.contents rows
+;;
+
 let () =
-  if not have_ruby
-  then
-    Printf.printf
-      "  SKIPPED: no ruby on PATH, so to_oniguruma is checked only against redfa's own \
-       parser\n"
-  else (
-    let terms_a, rows_a = onig_rows ~alphabet ~witnesses:corpus ~seed:31337 ~n:600 in
-    run_onig ~label:(Printf.sprintf "onigmo/ascii (%d terms)" terms_a) ~rows:rows_a;
-    let terms_m, rows_m =
-      onig_rows ~alphabet:meta_alphabet ~witnesses:meta_corpus ~seed:90210 ~n:600
-    in
-    run_onig ~label:(Printf.sprintf "onigmo/meta (%d terms)" terms_m) ~rows:rows_m;
-    let terms_x, rows_x = onig_adversarial_rows () in
-    run_onig ~label:(Printf.sprintf "onigmo/reserved (%d terms)" terms_x) ~rows:rows_x)
+  let sets =
+    [ "ascii", onig_rows ~alphabet ~witnesses:corpus ~seed:31337 ~n:600
+    ; "meta", onig_rows ~alphabet:meta_alphabet ~witnesses:meta_corpus ~seed:90210 ~n:600
+    ; "reserved", onig_adversarial_rows ()
+    ; "codepoints", onig_codepoint_rows ()
+    ]
+  in
+  List.iter
+    (fun engine ->
+       if not (available engine)
+       then Printf.printf "  SKIPPED: %s\n" engine.missing
+       else
+         List.iter
+           (fun (what, (terms, rows)) ->
+              run_onig
+                engine
+                ~label:(Printf.sprintf "%s/%s (%d terms)" engine.name what terms)
+                ~rows)
+           sets)
+    [ onigmo; oniguruma ]
 ;;
 
 (* -- the printers over the whole public type ------------------------------- *)

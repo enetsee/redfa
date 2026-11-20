@@ -325,7 +325,7 @@ let rec is_nullable = function
    loosest first, matching [prec_of]. An empty concatenation is [eps],
    so [()] and the branches of [a||b] parse.
 
-   Escapes are [\t], [\n], [\r], [\f], [\0], [\u{HHHH}], the
+   Escapes are [\t], [\n], [\r], [\f], [\0], [\xHH], [\u{HHHH}], the
    shorthand classes [\d], [\w], [\s] and their negations, and a
    backslash before any ASCII punctuation, which matches that character.
    Inside a class, [\]] and [\-] match the literal character.
@@ -425,6 +425,33 @@ let parse_unicode_escape c =
   !cp
 ;;
 
+(* [\xHH]: two hex digits, giving a codepoint from U+0000 to U+007F.
+
+   [to_oniguruma] writes the ASCII control characters this way, and
+   Oniguruma and Ruby read the same two-digit form as the same
+   codepoint. A value above 7F is an error here because those engines
+   read [\x80] as the byte 0x80, which is a different thing from the
+   codepoint U+0080. [\u{80}] is the escape for that codepoint. *)
+let parse_hex_escape c =
+  let start = c.at - 2 in
+  let digit () =
+    match Option.bind (peek c) hex_value with
+    | Some v ->
+      ignore (bump c);
+      v
+    | None -> fail_at start "\\x escape takes two hex digits"
+  in
+  let hi = digit () in
+  let lo = digit () in
+  let cp = (hi * 16) + lo in
+  if cp > 0x7F
+  then
+    fail_at
+      start
+      (Printf.sprintf "\\x%02X is above \\x7F, write \\u{%X} for the codepoint" cp cp);
+  cp
+;;
+
 (* Printable ASCII other than space, letters and digits: the characters
    the grammar reserves plus the remaining ASCII punctuation. Space and
    controls are excluded because [src] writes space unescaped and a
@@ -451,6 +478,7 @@ let parse_escape_cp c =
   | 'f' -> Some 0x0C
   | '0' -> Some 0x00
   | 'u' -> Some (parse_unicode_escape c)
+  | 'x' -> Some (parse_hex_escape c)
   | 'd' | 'w' | 's' | 'D' | 'W' | 'S' -> None
   | ch when is_ascii_punct ch -> Some (Char.code ch)
   (* Space, the C0 controls and DEL are written unescaped, so a
@@ -765,9 +793,37 @@ let to_string t =
 
 exception Emission_failed of string
 
+(* A codepoint outside printable ASCII, other than tab, newline and
+   carriage return, which the callers emit as [\t], [\n] and [\r].
+
+   An ASCII control character, U+0000 to U+001F or U+007F, is emitted
+   as [\xHH]. Oniguruma, Ruby and {!of_string} all read that form as
+   the same codepoint. Emitted as itself it would put a control byte
+   in the output, and a host that passes the pattern to Oniguruma as a
+   C string would cut the pattern short at a U+0000.
+
+   A codepoint from U+0080 up is emitted as the character itself, in
+   UTF-8, which has no byte below 0x80. No escape for these is read by
+   all three readers. [\xHH] is a byte to Oniguruma: [\x80] alone is
+   refused, and [\[\x7F-\x81\]] compiles and does not match
+   U+0080. Oniguruma reads [\x\{HHHH\}] and refuses
+   [\u\{HHHH\}] as an invalid code point value, and a TextMate
+   grammar holding a refused pattern fails to load. Ruby, which the
+   test suite runs the output through, reads [\u\{HHHH\}] and
+   refuses [\x\{HHHH\}]. {!of_string} reads [\u\{HHHH\}] only.
+
+   [Uchar.of_int] raises on a surrogate. A [Ucharset.t] holds scalar
+   values only, and an interval that spans the surrogates is stored as
+   two, so [cp] is always a scalar value. *)
+let cp_non_printable buf cp =
+  if cp < 0x80
+  then Buffer.add_string buf (Printf.sprintf "\\x%02X" cp)
+  else Buffer.add_utf_8_uchar buf (Uchar.of_int cp)
+;;
+
 (* Emits [cp] inside a bracket class. Tab, newline and carriage return
    are emitted as [\t], [\n] and [\r], and other codepoints outside
-   printable ASCII as [\u\{HHHH\}]. *)
+   printable ASCII by [cp_non_printable]. *)
 let cp_in_charset buf cp =
   match cp with
   | 0x09 -> Buffer.add_string buf "\\t"
@@ -782,7 +838,7 @@ let cp_in_charset buf cp =
        Buffer.add_char buf '\\';
        Buffer.add_char buf c
      | _ -> Buffer.add_char buf c)
-  | _ -> Buffer.add_string buf (Printf.sprintf "\\u{%X}" cp)
+  | _ -> cp_non_printable buf cp
 ;;
 
 let cp_outside_charset buf cp =
@@ -816,7 +872,7 @@ let cp_outside_charset buf cp =
        Buffer.add_char buf '\\';
        Buffer.add_char buf c
      | _ -> Buffer.add_char buf c)
-  | _ -> Buffer.add_string buf (Printf.sprintf "\\u{%X}" cp)
+  | _ -> cp_non_printable buf cp
 ;;
 
 let emit_interval buf lo hi =
